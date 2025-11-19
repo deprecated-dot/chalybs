@@ -1,8 +1,6 @@
 use serde::Deserialize;
-use std::collections::{BTreeSet, HashMap};
-
-use crate::errors::{ChalybsError, Result};
-use crate::util::parse_cpu_list;
+use crate::errors::{Result, ChalybsError};
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RootConfig {
@@ -29,16 +27,17 @@ pub struct VmConfig {
 
     #[serde(default)]
     pub peripherals: Option<PeripheralConfig>,
+
+    /// High-level behavior modes (single_gpu, dedicated, numa_aware, etc.)
+    /// All fields are optional; unset = auto / default.
+    #[serde(default)]
+    pub modes: ModeConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CpuConfig {
-    /// CPUs reserved for the VM (e.g. "8-15,40-47")
-    pub vm_cpus: String,
-
-    /// Optional explicit host CPUs. If omitted, Chalybs derives them.
-    #[serde(default)]
-    pub host_cpus: Option<String>,
+    pub host_cpus: String, // "0-7,32-39"
+    pub vm_cpus: String,   // "8-15,40-47"
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -54,6 +53,7 @@ pub struct QemuConfig {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct NumaConfig {
+    /// If set, preferred NUMA node for this VM (for future policies).
     pub node: Option<u16>,
 }
 
@@ -72,8 +72,33 @@ pub struct PciDeviceConfig {
     pub required: bool,
 }
 
-fn default_required() -> bool {
-    true
+fn default_required() -> bool { true }
+
+/// High-level behavior modes, configurable per-VM.
+/// All fields are Option<bool> to allow "auto" behavior when None.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ModeConfig {
+    /// If true, treat this as a single-GPU system and perform
+    /// bind/unbind to return the GPU to the host after shutdown.
+    pub single_gpu: Option<bool>,
+
+    /// If true, treat the VM’s GPU as dedicated to the guest.
+    /// Typically means no rebind to host on shutdown.
+    pub dedicated_gpu: Option<bool>,
+
+    /// If true, enable NUMA-aware policies (CPU/IRQ/memory).
+    /// Defaults to true on NUMA systems, false otherwise.
+    pub numa_aware: Option<bool>,
+
+    /// If true, perform "systems hygiene" before/after VM launch:
+    /// pagecache drop, reclaim, etc. (implementation TBD).
+    pub reset_on_launch: Option<bool>,
+
+    /// If true, perform DDC-based display input switching around launch.
+    pub ddc_control: Option<bool>,
+
+    /// If true, manage external power (e.g. Tasmota) for this VM.
+    pub tasmota_power: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -115,65 +140,16 @@ impl RootConfig {
             return Err(ChalybsError::Config("no VMs defined".into()));
         }
 
-        let mut global_vm_cpus = BTreeSet::<u32>::new();
-
         for (name, vm) in &self.vm {
             if vm.qemu.num_vcpus == 0 {
                 return Err(ChalybsError::Config(format!(
                     "vm {name}: num_vcpus must be > 0"
                 )));
             }
-
-            // Parse VM CPU list
-            let vm_cpus = parse_cpu_list(&vm.cpu.vm_cpus).map_err(|e| {
-                ChalybsError::Config(format!(
-                    "vm {name}: invalid vm_cpus '{}': {e}",
-                    vm.cpu.vm_cpus
-                ))
-            })?;
-
-            if vm_cpus.is_empty() {
+            if vm.cpu.vm_cpus.is_empty() {
                 return Err(ChalybsError::Config(format!(
                     "vm {name}: vm_cpus must not be empty"
                 )));
-            }
-
-            // FIXED HERE: parentheses for comparison
-            if (vm_cpus.len() as u32) < vm.qemu.num_vcpus {
-                return Err(ChalybsError::Config(format!(
-                    "vm {name}: vm_cpus ({} CPUs) has fewer CPUs than num_vcpus ({})",
-                    vm_cpus.len(),
-                    vm.qemu.num_vcpus
-                )));
-            }
-
-            // Optional host CPU validation
-            if let Some(ref host_str) = vm.cpu.host_cpus {
-                let host_cpus = parse_cpu_list(host_str).map_err(|e| {
-                    ChalybsError::Config(format!(
-                        "vm {name}: invalid host_cpus '{}': {e}",
-                        host_str
-                    ))
-                })?;
-
-                let vm_set: BTreeSet<u32> = vm_cpus.iter().copied().collect();
-                for c in &host_cpus {
-                    if vm_set.contains(c) {
-                        return Err(ChalybsError::Config(format!(
-                            "vm {name}: host_cpus and vm_cpus overlap on CPU {}",
-                            c
-                        )));
-                    }
-                }
-            }
-
-            // Global overlap check for vm_cpus
-            for c in vm_cpus {
-                if !global_vm_cpus.insert(c) {
-                    return Err(ChalybsError::Config(format!(
-                        "CPU {c} is used by more than one VM (including vm {name})"
-                    )));
-                }
             }
         }
 
