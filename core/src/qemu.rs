@@ -1,30 +1,31 @@
 use std::fs;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use tracing::{debug, info, warn};
 
 use crate::errors::{ChalybsError, Result};
-use crate::model::{VmRuntime, QemuState};
+use crate::model::{QemuState, VmRuntime};
 
 /// Preflight checks for QEMU and firmware paths.
 pub fn preflight(rt: &VmRuntime) -> Result<()> {
     let q = &rt.cfg.qemu;
 
-    if !std::path::Path::new(&q.binary).exists() {
+    if !Path::new(&q.binary).exists() {
         return Err(ChalybsError::Qemu(format!(
             "QEMU binary not found: {}",
             q.binary
         )));
     }
 
-    if !std::path::Path::new(&q.ovmf_code).exists() {
+    if !Path::new(&q.ovmf_code).exists() {
         return Err(ChalybsError::Qemu(format!(
             "OVMF code not found: {}",
             q.ovmf_code
         )));
     }
 
-    if !std::path::Path::new(&q.ovmf_vars).exists() {
+    if !Path::new(&q.ovmf_vars).exists() {
         return Err(ChalybsError::Qemu(format!(
             "OVMF vars not found: {}",
             q.ovmf_vars
@@ -34,9 +35,22 @@ pub fn preflight(rt: &VmRuntime) -> Result<()> {
     Ok(())
 }
 
+/// Derive QMP socket path for a given VM name.
+fn qmp_path_for_vm(vm_name: &str) -> String {
+    format!("/run/chalybs/{vm_name}.qmp")
+}
+
 /// Launch QEMU and move it into the vm cpuset.
 pub fn launch(rt: &mut VmRuntime) -> Result<()> {
     let q = &rt.cfg.qemu;
+    let vm_name = &rt.name;
+
+    // Ensure /run/chalybs exists for QMP sockets, etc.
+    fs::create_dir_all("/run/chalybs").map_err(|e| {
+        ChalybsError::Qemu(format!("failed to create /run/chalybs: {e}"))
+    })?;
+
+    let qmp_path = qmp_path_for_vm(vm_name);
 
     let mut cmd = Command::new(&q.binary);
 
@@ -50,9 +64,15 @@ pub fn launch(rt: &mut VmRuntime) -> Result<()> {
         .arg("-machine")
         .arg("q35,accel=kvm")
         .arg("-drive")
-        .arg(format!("if=pflash,format=raw,readonly,file={}", q.ovmf_code))
+        .arg(format!(
+            "if=pflash,format=raw,readonly,file={}",
+            q.ovmf_code
+        ))
         .arg("-drive")
-        .arg(format!("if=pflash,format=raw,file={}", q.ovmf_vars));
+        .arg(format!("if=pflash,format=raw,file={}", q.ovmf_vars))
+        // QMP socket for deterministic vCPU discovery.
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", qmp_path));
 
     if !q.args.trim().is_empty() {
         for tok in q.args.split_whitespace() {
@@ -72,7 +92,7 @@ pub fn launch(rt: &mut VmRuntime) -> Result<()> {
 
     let pid = child.id() as i32;
 
-    info!(pid, "spawned QEMU process");
+    info!(pid, vm = %vm_name, qmp = %qmp_path, "spawned QEMU process");
 
     // Move QEMU into vm cpuset if configured.
     if let Some(cg) = &rt.cgroups {
@@ -84,7 +104,11 @@ pub fn launch(rt: &mut VmRuntime) -> Result<()> {
                     procs_path.display()
                 ))
             })?;
-            info!(pid, path = %procs_path.display(), "moved QEMU to vm cpuset");
+            info!(
+                pid,
+                path = %procs_path.display(),
+                "moved QEMU to vm cpuset"
+            );
         } else {
             warn!(
                 path = %procs_path.display(),
