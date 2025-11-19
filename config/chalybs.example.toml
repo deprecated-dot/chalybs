@@ -1,0 +1,44 @@
+[vm.default]
+name = "win11-gpu"
+qemu_binary = "/usr/bin/qemu-system-x86_64"
+ovmf_code = "/usr/share/OVMF/OVMF_CODE.fd"
+ovmf_vars = "/var/lib/chalybs/win11_ovmf_vars.fd"
+memory_mb = 32768
+hugepages = true
+num_vcpus = 16
+
+[vm.default.cpu]
+host_cpus = "0-7,32-39"
+vm_cpus   = "8-15,40-47"
+
+[vm.default.numa]
+node = 1
+
+[[vm.default.devices.gpu]]
+pci_address = "0000:0a:00.0"
+required = true
+
+[[vm.default.devices.nvme]]
+pci_address = "0000:0b:00.0"
+required = true
+
+[[vm.default.devices.nic]]
+pci_address = "0000:0c:00.0"
+required = false
+
+[vm.default.peripherals.tasmota]
+url = "http://tasmota-kvm.local/cm"
+on_command = "Power ON"
+off_command = "Power OFF"
+
+[vm.default.peripherals.ddc]
+monitor_i2c_bus = 4
+vm_input = 2
+host_input = 1
+
+[vm.default.peripherals.looking_glass]
+shm_name = "looking-glass"
+
+[logging]
+level = "info"
+format = "pretty"
