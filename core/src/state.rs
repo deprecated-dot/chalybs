@@ -1,6 +1,6 @@
 use tracing::{info, instrument};
 
-use crate::errors::{Result, ChalybsError};
+use crate::errors::{ChalybsError, Result};
 use crate::model::VmRuntime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,8 +44,18 @@ impl VmStateMachine {
 
                 VmState::Validate => {
                     info!("state=Validate");
+
+                    // cpuset + QEMU path sanity
                     crate::cpuset::preflight(&self.rt)?;
                     crate::qemu::preflight(&self.rt)?;
+
+                    // PCI / GPU policy preflight
+                    //
+                    // NOTE: policy lives under config::pci (consuming the
+                    // crate::pci inventory module), so the correct path is:
+                    //   crate::config::pci::preflight_gpu_policy(...)
+                    crate::config::pci::preflight_gpu_policy(&self.rt.name, &self.rt.cfg)?;
+
                     self.state = VmState::ReserveCpus;
                 }
 
@@ -109,11 +119,14 @@ impl VmStateMachine {
 
     #[instrument(skip_all, fields(vm = %self.rt.name))]
     pub fn run_shutdown(&mut self) -> Result<()> {
+        // If we’re in Steady or close to it, transition to Shutdown
         match self.state {
             VmState::Steady | VmState::PinIrqs | VmState::PeripheralHooks => {
                 self.state = VmState::Shutdown;
             }
-            _ => {}
+            _ => {
+                // best-effort shutdown even from odd states
+            }
         }
 
         info!("state=Shutdown");
