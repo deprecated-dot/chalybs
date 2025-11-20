@@ -80,3 +80,21 @@ Three new architecture documents shipped:
 ## 🎯 Stability
 v0.3.1 is the first release to include both deterministic affinity *and* deterministic mode/capability resolution.
 
+# Chalybs v0.3.2 – PCI Foundations & GPU Policy Safety
+
+This release delivers the first fully functional milestone of the rewritten
+PCI layer. Chalybs now has a deterministic, sysfs-only PCI inventory
+mechanism and a GPU passthrough policy engine designed specifically for
+safety on single-GPU hosts.
+
+### Highlights
+- Full host PCI topology scanning using sysfs
+- Automatic detection of display-class devices (VGA/3D)
+- Enforcement of safe GPU passthrough rules before VM startup
+- Configurable GPU policy via `[vm.<name>.gpu]`
+- Strict failure modes for zero-GPU and unsafe single-GPU hosts
+- Strong error handling and consistent tracing output
+
+This lays the groundwork for the next major stage: PCI driver lifecycle,
+including detection of amdgpu/nvidia/vfio-pci, automatic unbind/bind, and
+safe restoration during VM shutdown.

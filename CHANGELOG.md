@@ -44,3 +44,19 @@
 - Added `PIPELINE_OVERVIEW.md`.
 - Updated architecture diagrams and state-flow documentation.
 
+## [0.3.2] – 2025-11-20
+### Added
+- Deterministic PCI inventory module (`pci.rs`)
+- GPU policy module with single-GPU protection and passthrough safety checks
+- Integration of GPU policy preflight into state machine (`Validate` phase)
+
+### Changed
+- Expanded VM configuration schema with `[vm.<name>.gpu]` policy section
+- Improved error messages for GPU passthrough and missing devices
+- Better logging around PCI discovery and GPU policy resolution
+
+### Fixed
+- Addressed PCI/Config cross-module sync and regression issues
+- Ensured build passes under Rust 1.91.1 with correct cargo toolchain path
+- Minor clippy/doc warnings acknowledged; no functional issues
+
