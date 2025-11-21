@@ -7,6 +7,7 @@ use crate::model::VmRuntime;
 pub enum VmState {
     Init,
     Validate,
+    PreparePci,
     ReserveCpus,
     LaunchQemu,
     DetectThreads,
@@ -55,6 +56,17 @@ impl VmStateMachine {
                     // crate::pci inventory module), so the correct path is:
                     //   crate::config::pci::preflight_gpu_policy(...)
                     crate::config::pci::preflight_gpu_policy(&self.rt.name, &self.rt.cfg)?;
+
+                    self.state = VmState::PreparePci;
+                }
+
+                VmState::PreparePci => {
+                    info!("state=PreparePci");
+
+                    // Phase 4: perform PCI-side effects for GPU passthrough:
+                    // unbind current drivers and bind configured GPUs to
+                    // vfio-pci, subject to earlier feasibility checks.
+                    crate::config::pci::prepare_gpu_passthrough(&self.rt.name, &self.rt.cfg)?;
 
                     self.state = VmState::ReserveCpus;
                 }

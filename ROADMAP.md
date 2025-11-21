@@ -1,101 +1,51 @@
-# Chalybs Roadmap (Rust Rewrite Edition)
+# Chalybs ROADMAP
+## v0.3.x Series – PCI Safety, VFIO Refinement, State Machine Stability
+- Complete GPU safety classification (Phases 1–5)
+- Add PCI unbind/bind simulation and real VFIO binding primitives
+- Harden cpuset NUMA behavior (C2)
+- Stabilize QEMU launch path + thread/IRQ pinning race‑condition cleanup
+- Unified Architecture Document integration
 
-This roadmap tracks the current, intermediate, and long-term goals of the
-Chalybs Rust rewrite. The final scope represents the intended steady-state
-feature set: deterministic VFIO virtualization on Linux with predictable
-behavior, clarity of configuration, and safety by default.
+## v0.4.x – VFIO Orchestration & Hotplug Era
+- Full VFIO device manager abstraction
+- Per‑device bind/unbind orchestration with dry‑run mode
+- Implement live PCI rescan helpers
+- Begin work on hot‑plug/HOTREMOVE safety heuristics
+- Coordinator/daemon groundwork
 
----
+## v0.5.x – Daemon & IPC
+- Implement chalybsd event loop
+- UDS IPC protocol + request/response model
+- VM lifecycle management from daemon, CLI becomes a thin client
+- Real‑time telemetry: IRQ mapping, MSI vector report, thread heatmaps
 
-# Current Milestone (v0.3.x series)
-## PCI Foundations & Safety Layer
-✔ Deterministic PCI inventory from sysfs  
-✔ GPU passthrough safety (single-GPU protection, zero-GPU guardrails)  
-⬜ PCI Phase 2: GPU driver detection (amdgpu/nvidia/vfio-pci)  
-⬜ PCI Phase 3: Safe unbind/bind orchestration  
-⬜ PCI Phase 4: IOMMU group validation + strict mode  
-⬜ PCI Phase 5: Capability graph (host capabilities → allowed VM modes)
+## v0.6.x – NUMA Optimizer & Scheduler
+- Automated NUMA placement scoring
+- Memory locality advisor
+- IRQ affinity watching service
+- Predictive pinning scheduler for transient QEMU threads
 
-## CPU / IRQ Affinity
-✔ cpuset creation  
-✔ NUMA-aware vCPU scheduling  
-✔ IRQ detection + pinning  
-⬜ NUMA-policy-based IRQ placement refinement  
-⬜ Dynamic IRQ migration on VM restart
+## v0.7.x – Device Graph / Auto-Topology Detection
+- IOMMU graph builder
+- Auto-detection of unsafe sharing between groups
+- “Show me why this device cannot be passed through” explanations
+- Visualization export (mermaid + SVG)
 
-## Configuration
-✔ Clean TOML schema  
-✔ Device list resolution  
-⬜ Mode definitions (Dedicated GPU, Hybrid, Single-GPU Safe, IGPU-Primary)  
-⬜ Validation of unsupported combinations  
-⬜ Host capabilities gating (e.g., "no IOMMU → no passthrough")
+## v0.8.x – Advanced Peripheral Hooks
+- Full DDC utilization (monitor input switching via policy triggers)
+- Looking Glass optimized integration
+- USB/NVMe safe handoffs
+- Per-VM hook bundles (pre-launch, post-launch, shutdown)
 
----
+## v0.9.x – Reliability / Hardened Mode
+- Full transactional VM launch (rollback-on-failure)
+- Health probes + watchdog
+- Daemon-on-boot startup sequencing
+- Hermetic mode for production environments
 
-# Intermediate Milestones (v0.4.x series)
-## PCI Driver Lifecycle Engine (Core Feature)
-A deterministic engine that:
-- Detects current GPU driver (amdgpu/nvidia/vfio-pci)
-- Evaluates safe handoff
-- Quiesces userspace consumers (DRM, console, fbcon)
-- Performs orderly unbind → bind to vfio-pci
-- Starts VM
-- On shutdown: unbind vfio-pci → rebind host driver
-- Optional hotplug support for secondary GPUs
-
-## Device Mode System
-Introduce structured VM operational modes:
-- `dedicated_gpu`
-- `single_gpu_mode`
-- `dual_gpu_switch`
-- `igpu_primary`
-- `auto`
-These will be validated against host capabilities and PCI topology.
-
-## Improved Peripheral Hooks
-- Tasmota: async control + retries  
-- DDC: safe probe logic + error recovery  
-- LookingGlass: shared memory lifecycle verification  
-
----
-
-# Long-Term Milestones (v0.5.x – v0.9.x)
-## Full Deterministic Virtualization Stack
-- Machine-readable VM status API (daemon)
-- CLI for lifecycle: `chalybs start`, `stop`, `attach`, `events`  
-- Persistent VM registry  
-- Advanced logging pipeline (journald optional)
-
-## Storage / Networking Expansion
-- PCIe NVMe passthrough lifecycle (similar to GPU)  
-- PCIe NIC passthrough safety (VFIO group scanning + checks)  
-- vhost-user integration
-
-## Monitoring & Introspection
-- Per-thread stats  
-- IRQ distribution visualizer  
-- PCI device health tracking
-
-## Testing & Validation Framework
-- Synthetic PCI trees  
-- Regression suite for PCI and NUMA policies  
-- Sandbox VM mode for dry-run validation  
-
----
-
-# Final Scope (v1.0.0)
-A fully deterministic VFIO + QEMU orchestration layer that:
-
-- Bootstraps VMs with strict CPU, IRQ, PCI, and NUMA policy  
-- Ensures zero nondeterministic behavior  
-- Protects host from unsafe passthrough  
-- Unifies driver lifecycle, policy, and configuration  
-- Has predictable, reproducible operation on any Linux host with IOMMU  
-- Has no external dependencies (no lspci, no shell calls, no systemd magic)  
-- Provides a stable CLI + daemon API  
-- Supports multi-VM scenarios with clear resource isolation  
-
-Chalybs reaches 1.0 when the system is deterministic, reproducible, safe, and
-fully driver-lifecycle aware.
-
----
+## v1.0 – Production-Grade Chalybs
+- Versioned configuration schema
+- Stable IPC
+- Complete GPU/iGPU orchestration strategy
+- Verified passthrough safety engine
+- End-to-end test matrix: PCI, QEMU, IRQs, NUMA, VFIO workflows

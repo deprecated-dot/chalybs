@@ -1,62 +1,41 @@
-# Changelog
+# Chalybs CHANGELOG
 
-## v0.3.0 – Deterministic Baseline (NUMA‑Aware C2)
+## v0.3.3 — GPU Driver Detection, Unbind Safety Simulation, Unified Architecture Doc
+
+**Release Date:** TBD
+
 ### Added
-- Fully deterministic vCPU discovery using QMP `query-cpus-fast` with `/proc/<pid>/task` fallback.
-- NUMA‑aware cpuset derivation (C2 strategy): derive host CPUs from online CPUs minus VM CPUs unless explicitly configured.
-- Strong cpuset creation + strict cpuset.mems validation.
-- Robust QMP handshake with deterministic retries and full protocol sanity checks.
-- vCPU pinning improvements with explicit EINVAL handling and kernel sanity enforcement.
-- IRQ discovery and pinning framework with safe device‑empty fallbacks.
-- End-to-end deterministic VM bring‑up pipeline with structured logging.
-
-### Fixed
-- Eliminated nondeterministic vCPU detection behavior on recent QEMU versions.
-- Corrected EINVAL decode paths for nix 0.29 semantics.
-- Fixed stale borrow conflicts in QMP reader handling.
-- Removed legacy procfs-only detection path.
-
-## [0.3.1] – 2025-11-19
-### Added
-- Introduced **Mode + Capability Architecture**, enabling deterministic behavior across varying host hardware.
-- Added full `HostCapabilities` detection: GPU count, NUMA layout, VFIO status, PCI topology.
-- Added new runtime Mode resolver supporting:
-  - `single_gpu`
-  - `dual_gpu_preferred`
-  - `dual_gpu_fallback`
-  - `dedicated_gpu`
-- Added fully deterministic NUMA-aware host CPU derivation (C2 logic) with override support.
+- **PCI Phase 2:** GPU driver detection and safety classification.
+- **PCI Phase 3:** Read‑only unbind feasibility simulation (IOMMU‑group aware).
+- **PCI Phase 4 foundation:** VFIO bind/unbind helper functions (no automation yet).
+- **Unified Super‑Doc:** `CHALYBS_EXECUTION_AND_ARCHITECTURE.md`
+  - Merged architecture, execution pipeline, NUMA model, PCI/GPU pipeline, and mode/capability structure.
+  - Replaces several scattered documents:
+    - `docs_pipeline.md`
+    - `PIPELINE_OVERVIEW.md`
+    - `docs_architecture.md`
+    - `MODE_CAPABILITY_ARCHITECTURE.md`
+    - `C2_NUMA_DERIVATION.md`
 
 ### Changed
-- Updated vCPU/IRQ discovery pipeline to QMP-first with procfs fallback.
-- Tightened cpuset logic and made all cpuset transitions atomic.
-- Improved state engine logs (Init → Validate → ReserveCpus → Launch → DetectThreads → PinVcpus → DetectMsi → PinIrqs → PeripheralHooks → SteadyState).
-- Cleaned up affinity code path and reduced nondeterministic cases.
+- Minor cpuset documentation fixes for clippy compliance.
+- Topology/scanning and PCI policy paths clarified in state machine docs.
 
-### Fixed
-- Eliminated borrow-checker errors from QMP handling.
-- Fixed CPU-range parsing to properly bubble ChalybsError.
-- Resolved struct/field mismatches generated during large refactors.
+### Removed
+- No code removed, but several old documents are now superseded by the unified doc.
 
-### Documentation
-- Added `MODE_CAPABILITY_ARCHITECTURE.md`.
-- Added `C2_NUMA_DERIVATION.md`.
-- Added `PIPELINE_OVERVIEW.md`.
-- Updated architecture diagrams and state-flow documentation.
+---
 
-## [0.3.2] – 2025-11-20
-### Added
-- Deterministic PCI inventory module (`pci.rs`)
-- GPU policy module with single-GPU protection and passthrough safety checks
-- Integration of GPU policy preflight into state machine (`Validate` phase)
+## v0.3.2 — PCI Inventory & Policy Foundations
+- Full PCI inventory rebuilt from sysfs with robust error-handling.
+- PCI policy preflight wired into VM state machine.
+- Single-GPU safety enforcement implemented.
 
-### Changed
-- Expanded VM configuration schema with `[vm.<name>.gpu]` policy section
-- Improved error messages for GPU passthrough and missing devices
-- Better logging around PCI discovery and GPU policy resolution
+## v0.3.1 — Initial QEMU Launch Pipeline
+- VM state machine implemented.
+- cpuset creation + teardown.
+- IRQ/MSI detection and pinning.
 
-### Fixed
-- Addressed PCI/Config cross-module sync and regression issues
-- Ensured build passes under Rust 1.91.1 with correct cargo toolchain path
-- Minor clippy/doc warnings acknowledged; no functional issues
-
+## v0.3.0 — Initial Project Resurrection & Refactor into Rust
+- Full crate reorganization.
+- Core modules established.

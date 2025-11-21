@@ -1,100 +1,62 @@
-# Release Notes – v0.3.0 Deterministic Baseline
+# Chalybs v0.3.3 Release Notes
 
-This release marks the first fully deterministic, NUMA‑aware baseline of **Chalybs**.
+This release introduces major advancements in PCI/GPU introspection and safety, along with a fully unified architectural reference document.
 
-## Highlights
-- **Deterministic thread discovery** via QMP with process‑level fallback.
-- **NUMA‑aware cpuset derivation (C2)** for universal portability across:
-  - HEDT (Threadripper, EPYC)
-  - Workstation/server
-  - Standard consumer systems
-- **Hardened cpuset orchestration** with guaranteed mem-node alignment.
-- **Predictable vCPU pinning** with validated layout matching and kernel sanity enforcement.
-- **Graceful degradation** when GPUs / NVMe / NIC passthrough devices are not configured.
+---
 
-## Why this matters
-Modern QEMU builds removed stable vCPU thread names. Chalybs now uses the *only* cross-version deterministic mechanism (QMP `query-cpus-fast`) plus strict fallback logic to ensure stable behavior on all kernels and all QEMU variants.
+## 🆕 Major Features
 
-NUMA-aware steering guarantees that:
-- vCPUs
-- IRQs
-- Assigned PCIe devices
+### 1. GPU Driver Detection (PCI Phase 2)
+Chalybs can now classify host GPUs by:
+- Bound kernel driver (vfio‑pci, amdgpu, radeon, nvidia, nouveau, or other)
+- Host safety class (HostOwned, VfioReady, Unknown)
 
-all land on the same NUMA node, maximizing determinism and throughput.
+### 2. GPU Unbind Safety Simulation (PCI Phase 3)
+Chalybs simulates whether unbinding a GPU appears:
+- **Safe**
+- **Risky** (requires operator review)
+- **Unsafe** (cannot isolate—e.g., no IOMMU group)
 
-This release becomes the foundation for:
-- scheduled hooks,
-- device orchestration,
-- IO threading policies,
-- future multi‑VM coexistence guarantees.
+This simulation is strictly read‑only and does *not* write to sysfs.
 
-# Chalybs v0.3.1 — Mode/Capability Architecture + NUMA Derivation
+### 3. VFIO Bind/Unbind Helpers (PCI Phase 4 foundation)
+Low‑level helpers were added:
+- `unbind_current_driver`
+- `bind_to_vfio_pci`
 
-This release builds on the v0.3.0 *Deterministic Baseline* by introducing the next major chunk of infrastructure necessary for full feature parity with the legacy bash suite.
+No automatic unbinding is performed yet—Phase 5 work.
 
-v0.3.1 brings:
+---
 
-## 🚀 Major Features
+## 📘 New Unified Architecture Document
 
-### 1. Mode System
-Chalybs now supports explicit runtime modes, with automatic fallback:
-- **single_gpu**
-- **dual_gpu_preferred**
-- **dual_gpu_fallback**
-- **dedicated_gpu**
+A major improvement for maintainability:
 
-Modes are resolved deterministically based on host capabilities and user config.
+### **`CHALYBS_EXECUTION_AND_ARCHITECTURE.md`**
+This is now the authoritative reference for:
+- Execution pipeline + QEMU/IRQ lifecycle
+- NUMA + cpuset strategy (C2)
+- PCI/GPU architecture, Phases 1–4
+- Mode/capability architecture
+- Peripheral hooks
 
-### 2. HostCapabilities Engine
-Chalybs now auto-discovers:
-- NUMA node count
-- CPU→NUMA mapping
-- GPU count & PCI topology
-- VFIO availability
-- Single-GPU vs Dual-GPU safety constraints
+This document replaces fragmented prior docs:
+- `docs_pipeline.md`
+- `PIPELINE_OVERVIEW.md`
+- `docs_architecture.md`
+- `MODE_CAPABILITY_ARCHITECTURE.md`
+- `C2_NUMA_DERIVATION.md`
 
-This dramatically reduces configuration requirements.
+---
 
-### 3. Deterministic NUMA Derivation (C2)
-Host CPU selection now uses:
-- explicit config (if provided)
-- otherwise: derived host CPU = all CPUs not in vm_cpus
+## 🧹 Additional Improvements
+- cpuset module doc cleanup (clippy compliance).
+- State machine comments expanded for clarity.
+- Future PCI phases planned and documented.
 
-Works perfectly across:
-- Threadripper 2990WX/3990X
-- Ryzen/Intel monolithic dies
-- Multi-socket systems
+---
 
-### 4. Improved vCPU & IRQ affinity
-- QMP-first discovery
-- Procfs fallback
-- Deterministic pinning ordering
-- Proper state-machine integration
+## ✅ Compatibility
+- Fully backward compatible with v0.3.2.
+- No changes required to VM configs.
 
-## 📚 Documentation
-Three new architecture documents shipped:
-- MODE_CAPABILITY_ARCHITECTURE.md
-- C2_NUMA_DERIVATION.md
-- PIPELINE_OVERVIEW.md
-
-## 🎯 Stability
-v0.3.1 is the first release to include both deterministic affinity *and* deterministic mode/capability resolution.
-
-# Chalybs v0.3.2 – PCI Foundations & GPU Policy Safety
-
-This release delivers the first fully functional milestone of the rewritten
-PCI layer. Chalybs now has a deterministic, sysfs-only PCI inventory
-mechanism and a GPU passthrough policy engine designed specifically for
-safety on single-GPU hosts.
-
-### Highlights
-- Full host PCI topology scanning using sysfs
-- Automatic detection of display-class devices (VGA/3D)
-- Enforcement of safe GPU passthrough rules before VM startup
-- Configurable GPU policy via `[vm.<name>.gpu]`
-- Strict failure modes for zero-GPU and unsafe single-GPU hosts
-- Strong error handling and consistent tracing output
-
-This lays the groundwork for the next major stage: PCI driver lifecycle,
-including detection of amdgpu/nvidia/vfio-pci, automatic unbind/bind, and
-safe restoration during VM shutdown.

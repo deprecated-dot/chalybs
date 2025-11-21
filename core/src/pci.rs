@@ -45,6 +45,54 @@ pub struct PciFunction {
     pub numa_node: Option<i32>,
 }
 
+/// GPU-specific driver binding kinds discovered from sysfs for display
+/// controllers. This is a pure classification of the bound kernel
+/// driver name; it does not itself apply any policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuDriverKind {
+    /// Bound to vfio-pci, typically ready for passthrough.
+    Vfio,
+    /// Bound to an AMD GPU driver such as amdgpu or radeon.
+    AmdGpu,
+    /// Bound to the proprietary NVIDIA driver.
+    Nvidia,
+    /// Bound to the open-source nouveau driver.
+    Nouveau,
+    /// Bound to some other kernel driver; we preserve the raw name.
+    OtherKernel(String),
+    /// No bound kernel driver for this GPU.
+    Unbound,
+}
+
+/// Safety classification for host GPUs from the perspective of
+/// passthrough. This is purely descriptive in Phase 2 and does not
+/// change policy decisions yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuSafetyClass {
+    /// Bound to vfio-pci and expected to be safe for passthrough.
+    VfioReady,
+    /// Bound to a host GPU driver and likely backing host display or
+    /// otherwise owned by the host.
+    HostOwned,
+    /// No driver or an unknown driver; requires operator judgement.
+    Unknown,
+}
+
+/// Phase 3/4: unbind safety simulation result for a GPU.
+///
+/// This does *not* itself unbind anything; it only describes how safe
+/// it appears to be to detach this device based on current topology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuUnbindFeasibility {
+    /// Nothing suspicious detected from inventory’s point of view.
+    Safe,
+    /// Potentially disruptive but not clearly fatal; operator judgement
+    /// required before attempting unbind.
+    Risky(String),
+    /// Strong indicators that unbinding would be unsafe.
+    Unsafe(String),
+}
+
 impl PciFunction {
     /// Return the (base, sub, prog_if) triple derived from the raw class.
     ///
@@ -70,6 +118,45 @@ impl PciFunction {
     /// Programming interface byte.
     pub fn class_prog_if(&self) -> u8 {
         (self.class & 0xff) as u8
+    }
+
+    /// For display controllers, classify the bound kernel driver into a
+    /// GPU driver kind. Returns None for non-GPU functions.
+    pub fn gpu_driver_kind(&self) -> Option<GpuDriverKind> {
+        if !self.is_display_controller() {
+            return None;
+        }
+
+        let driver = match &self.driver {
+            Some(d) => d.as_str(),
+            None => return Some(GpuDriverKind::Unbound),
+        };
+
+        let kind = match driver {
+            "vfio-pci" => GpuDriverKind::Vfio,
+            "amdgpu" | "radeon" => GpuDriverKind::AmdGpu,
+            "nvidia" => GpuDriverKind::Nvidia,
+            "nouveau" => GpuDriverKind::Nouveau,
+            other => GpuDriverKind::OtherKernel(other.to_string()),
+        };
+
+        Some(kind)
+    }
+
+    /// For display controllers, classify the safety of this GPU from the
+    /// host perspective. Returns None for non-GPU functions.
+    pub fn gpu_safety_class(&self) -> Option<GpuSafetyClass> {
+        let kind = self.gpu_driver_kind()?;
+
+        let safety = match kind {
+            GpuDriverKind::Vfio => GpuSafetyClass::VfioReady,
+            GpuDriverKind::AmdGpu | GpuDriverKind::Nvidia | GpuDriverKind::Nouveau => {
+                GpuSafetyClass::HostOwned
+            }
+            GpuDriverKind::OtherKernel(_) | GpuDriverKind::Unbound => GpuSafetyClass::Unknown,
+        };
+
+        Some(safety)
     }
 
     /// Return true if this function is some kind of display controller (GPU).
@@ -98,12 +185,125 @@ impl PciFunction {
         let (base, sub, _pi) = self.class_triple();
         base == 0x0c && sub == 0x03
     }
+
+    /// Phase 4: unbind this device from its current kernel driver, if any.
+    ///
+    /// This uses the classic sysfs interface:
+    ///   /sys/bus/pci/drivers/<driver>/unbind  ← echo BDF
+    pub fn unbind_current_driver(&self) -> Result<()> {
+        let driver_name = match &self.driver {
+            Some(d) => d,
+            None => {
+                debug!(
+                    bdf = self.bdf.as_str(),
+                    "no bound driver for PCI function; skipping unbind"
+                );
+                return Ok(());
+            }
+        };
+
+        let driver_unbind_path = Path::new("/sys/bus/pci/drivers")
+            .join(driver_name)
+            .join("unbind");
+
+        if !driver_unbind_path.exists() {
+            return Err(ChalybsError::Vfio(format!(
+                "cannot unbind {bdf}: driver unbind path {} does not exist",
+                driver_unbind_path.display(),
+                bdf = self.bdf
+            )));
+        }
+
+        debug!(
+            bdf = self.bdf.as_str(),
+            driver = driver_name.as_str(),
+            path = %driver_unbind_path.display(),
+            "unbinding PCI function from current driver"
+        );
+
+        fs::write(&driver_unbind_path, format!("{}\n", self.bdf)).map_err(|e| {
+            ChalybsError::Vfio(format!(
+                "failed to write BDF {} to {} for unbind: {e}",
+                self.bdf,
+                driver_unbind_path.display()
+            ))
+        })
+    }
+
+    /// Phase 4: bind this device to vfio-pci, if possible.
+    ///
+    /// If it is already bound to vfio-pci, this is a no-op.
+    ///
+    /// This uses:
+    ///   /sys/bus/pci/drivers/vfio-pci/bind  ← echo BDF
+    ///
+    /// We assume the operator has already loaded the vfio-pci module and
+    /// configured any vendor/device id matching as needed.
+    pub fn bind_to_vfio_pci(&self) -> Result<()> {
+        if matches!(self.driver.as_deref(), Some("vfio-pci")) {
+            debug!(
+                bdf = self.bdf.as_str(),
+                "PCI function already bound to vfio-pci; skipping bind"
+            );
+            return Ok(());
+        }
+
+        let bind_path = Path::new("/sys/bus/pci/drivers/vfio-pci/bind");
+
+        if !bind_path.exists() {
+            return Err(ChalybsError::Vfio(format!(
+                "vfio-pci bind path {} does not exist; \
+                 ensure vfio-pci is loaded and configured",
+                bind_path.display()
+            )));
+        }
+
+        debug!(
+            bdf = self.bdf.as_str(),
+            path = %bind_path.display(),
+            "binding PCI function to vfio-pci"
+        );
+
+        fs::write(bind_path, format!("{}\n", self.bdf)).map_err(|e| {
+            ChalybsError::Vfio(format!(
+                "failed to bind BDF {} to vfio-pci via {}: {e}",
+                self.bdf,
+                bind_path.display()
+            ))
+        })
+    }
 }
 
 /// Collection of all discovered PCI functions on the host.
 #[derive(Debug, Clone)]
 pub struct PciInventory {
     pub functions: Vec<PciFunction>,
+}
+
+/// Summary information for GPU-like PCI functions, including their
+/// driver binding and safety classification.
+#[derive(Debug, Clone)]
+pub struct GpuFunctionSummary {
+    pub bdf: String,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub driver: Option<String>,
+    pub driver_kind: Option<GpuDriverKind>,
+    pub safety: Option<GpuSafetyClass>,
+}
+
+/// Phase 3/4: simulated unbind safety for a given GPU.
+#[derive(Debug, Clone)]
+pub struct GpuUnbindAssessment {
+    pub bdf: String,
+    pub current_driver: Option<String>,
+    pub safety_class: GpuSafetyClass,
+    pub iommu_group: Option<u32>,
+
+    /// Other members in the same IOMMU group (BDFs), excluding this GPU.
+    pub group_members: Vec<String>,
+
+    pub feasibility: GpuUnbindFeasibility,
 }
 
 impl PciInventory {
@@ -181,6 +381,22 @@ impl PciInventory {
             .collect()
     }
 
+    /// Return a summary of all GPU-like functions, including driver
+    /// binding and safety classification.
+    pub fn gpu_summaries(&self) -> Vec<GpuFunctionSummary> {
+        self.gpus()
+            .into_iter()
+            .map(|f| GpuFunctionSummary {
+                bdf: f.bdf.clone(),
+                vendor_id: f.vendor_id,
+                device_id: f.device_id,
+                driver: f.driver.clone(),
+                driver_kind: f.gpu_driver_kind(),
+                safety: f.gpu_safety_class(),
+            })
+            .collect()
+    }
+
     /// Return all functions that look like network controllers.
     pub fn nics(&self) -> Vec<&PciFunction> {
         self.functions
@@ -228,10 +444,7 @@ impl PciInventory {
     ///   * If present in inventory → returned.
     ///   * If missing and `required = true` → error.
     ///   * If missing and `required = false` → silently skipped.
-    pub fn resolve_configured(
-        &self,
-        cfgs: &[PciDeviceConfig],
-    ) -> Result<Vec<&PciFunction>> {
+    pub fn resolve_configured(&self, cfgs: &[PciDeviceConfig]) -> Result<Vec<&PciFunction>> {
         let mut out = Vec::new();
 
         for dev in cfgs {
@@ -262,6 +475,106 @@ impl PciInventory {
         }
 
         Ok(out)
+    }
+
+    /// Phase 3: simulate unbind safety for each GPU discovered in the
+    /// inventory (read-only, no sysfs writes).
+    pub fn assess_gpu_unbind_safety(&self) -> Vec<GpuUnbindAssessment> {
+        let groups = self.by_iommu_group();
+        let mut out = Vec::new();
+
+        for gpu in self.gpus() {
+            let safety = gpu.gpu_safety_class().unwrap_or(GpuSafetyClass::Unknown);
+            let group_id = gpu.iommu_group;
+
+            let mut member_bdfs: Vec<String> = Vec::new();
+            let feasibility = match group_id {
+                None => GpuUnbindFeasibility::Unsafe(
+                    "GPU has no IOMMU group; cannot safely isolate for passthrough".to_string(),
+                ),
+                Some(gid) => match groups.get(&gid) {
+                    None => GpuUnbindFeasibility::Risky(
+                        "IOMMU group not found in inventory; treating as risky".to_string(),
+                    ),
+                    Some(members) => {
+                        for m in members {
+                            if m.bdf != gpu.bdf {
+                                member_bdfs.push(m.bdf.clone());
+                            }
+                        }
+
+                        evaluate_gpu_unbind_feasibility(gpu, &safety, members)
+                    }
+                },
+            };
+
+            out.push(GpuUnbindAssessment {
+                bdf: gpu.bdf.clone(),
+                current_driver: gpu.driver.clone(),
+                safety_class: safety,
+                iommu_group: group_id,
+                group_members: member_bdfs,
+                feasibility,
+            });
+        }
+
+        out
+    }
+}
+
+/// Decide how safe it looks to unbind `gpu`, given its safety class and
+/// all devices in its IOMMU group.
+fn evaluate_gpu_unbind_feasibility(
+    gpu: &PciFunction,
+    safety: &GpuSafetyClass,
+    group_members: &[&PciFunction],
+) -> GpuUnbindFeasibility {
+    match safety {
+        GpuSafetyClass::VfioReady => {
+            // If the group contains only this GPU and other vfio-bound or
+            // unbound GPUs, we lean "Safe". Any non-GPU or host-owned device
+            // in the group downgrades the assessment to Risky.
+            let mut problematic: Vec<String> = Vec::new();
+
+            for member in group_members {
+                if member.bdf == gpu.bdf {
+                    continue;
+                }
+
+                if !member.is_display_controller() {
+                    problematic.push(member.bdf.clone());
+                    continue;
+                }
+
+                match member.gpu_driver_kind() {
+                    Some(GpuDriverKind::Vfio) | Some(GpuDriverKind::Unbound) | None => {
+                        // acceptable
+                    }
+                    Some(_) => {
+                        problematic.push(member.bdf.clone());
+                    }
+                }
+            }
+
+            if problematic.is_empty() {
+                GpuUnbindFeasibility::Safe
+            } else {
+                GpuUnbindFeasibility::Risky(format!(
+                    "GPU shares IOMMU group with other non-vfio or non-GPU devices: {}",
+                    problematic.join(", ")
+                ))
+            }
+        }
+
+        GpuSafetyClass::HostOwned => GpuUnbindFeasibility::Risky(
+            "GPU appears host-owned (bound to graphics driver); unbinding may disrupt host display"
+                .to_string(),
+        ),
+
+        GpuSafetyClass::Unknown => GpuUnbindFeasibility::Risky(
+            "GPU driver state is unknown or unbound; operator review required before unbinding"
+                .to_string(),
+        ),
     }
 }
 
@@ -342,4 +655,146 @@ fn read_numa_node(dir: &Path) -> Option<i32> {
 /// utility and call it explicitly when necessary.
 pub fn rescan_pci_bus() -> Result<()> {
     fs::write("/sys/bus/pci/rescan", "1\n").map_err(ChalybsError::Io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_gpu(driver: Option<&str>, iommu_group: Option<u32>) -> PciFunction {
+        PciFunction {
+            bdf: "0000:01:00.0".to_string(),
+            vendor_id: 0x1234,
+            device_id: 0x5678,
+            class: 0x030000, // display controller
+            driver: driver.map(|d| d.to_string()),
+            iommu_group,
+            numa_node: Some(0),
+        }
+    }
+
+    fn make_non_gpu() -> PciFunction {
+        PciFunction {
+            bdf: "0000:02:00.0".to_string(),
+            vendor_id: 0x1234,
+            device_id: 0x5678,
+            class: 0x020000, // network controller
+            driver: Some("e1000e".to_string()),
+            iommu_group: Some(2),
+            numa_node: Some(0),
+        }
+    }
+
+    #[test]
+    fn gpu_driver_kind_is_none_for_non_gpu() {
+        let nic = make_non_gpu();
+        assert!(nic.gpu_driver_kind().is_none());
+        assert!(nic.gpu_safety_class().is_none());
+    }
+
+    #[test]
+    fn gpu_driver_kind_classification_basic() {
+        let vfio = make_gpu(Some("vfio-pci"), Some(1));
+        assert!(matches!(vfio.gpu_driver_kind(), Some(GpuDriverKind::Vfio)));
+
+        let amd = make_gpu(Some("amdgpu"), Some(1));
+        assert!(matches!(amd.gpu_driver_kind(), Some(GpuDriverKind::AmdGpu)));
+
+        let radeon = make_gpu(Some("radeon"), Some(1));
+        assert!(matches!(
+            radeon.gpu_driver_kind(),
+            Some(GpuDriverKind::AmdGpu)
+        ));
+
+        let nvidia = make_gpu(Some("nvidia"), Some(1));
+        assert!(matches!(
+            nvidia.gpu_driver_kind(),
+            Some(GpuDriverKind::Nvidia)
+        ));
+
+        let nouveau = make_gpu(Some("nouveau"), Some(1));
+        assert!(matches!(
+            nouveau.gpu_driver_kind(),
+            Some(GpuDriverKind::Nouveau)
+        ));
+
+        let other = make_gpu(Some("weirdgpu"), Some(1));
+        match other.gpu_driver_kind() {
+            Some(GpuDriverKind::OtherKernel(name)) => assert_eq!(name, "weirdgpu"),
+            _ => panic!("expected OtherKernel"),
+        }
+
+        let unbound = make_gpu(None, Some(1));
+        assert!(matches!(
+            unbound.gpu_driver_kind(),
+            Some(GpuDriverKind::Unbound)
+        ));
+    }
+
+    #[test]
+    fn gpu_safety_classification_basic() {
+        let vfio = make_gpu(Some("vfio-pci"), Some(1));
+        assert!(matches!(
+            vfio.gpu_safety_class(),
+            Some(GpuSafetyClass::VfioReady)
+        ));
+
+        let host_owned = make_gpu(Some("amdgpu"), Some(1));
+        assert!(matches!(
+            host_owned.gpu_safety_class(),
+            Some(GpuSafetyClass::HostOwned)
+        ));
+
+        let unknown = make_gpu(Some("weirdgpu"), Some(1));
+        assert!(matches!(
+            unknown.gpu_safety_class(),
+            Some(GpuSafetyClass::Unknown)
+        ));
+
+        let unbound = make_gpu(None, Some(1));
+        assert!(matches!(
+            unbound.gpu_safety_class(),
+            Some(GpuSafetyClass::Unknown)
+        ));
+    }
+
+    #[test]
+    fn gpu_unbind_assessment_simple_safe() {
+        // Single vfio GPU in its own IOMMU group.
+        let gpu = make_gpu(Some("vfio-pci"), Some(10));
+
+        let inv = PciInventory {
+            functions: vec![gpu],
+        };
+
+        let assessments = inv.assess_gpu_unbind_safety();
+        assert_eq!(assessments.len(), 1);
+        let a = &assessments[0];
+
+        assert_eq!(a.iommu_group, Some(10));
+        assert!(a.group_members.is_empty());
+        assert!(matches!(a.feasibility, GpuUnbindFeasibility::Safe));
+    }
+
+    #[test]
+    fn gpu_unbind_assessment_no_iommu_group_is_unsafe() {
+        let gpu = make_gpu(Some("vfio-pci"), None);
+
+        let inv = PciInventory {
+            functions: vec![gpu],
+        };
+
+        let assessments = inv.assess_gpu_unbind_safety();
+        assert_eq!(assessments.len(), 1);
+        let a = &assessments[0];
+
+        assert!(matches!(a.feasibility, GpuUnbindFeasibility::Unsafe(_)));
+    }
+
+    #[test]
+    fn bind_to_vfio_is_noop_if_already_bound() {
+        let gpu = make_gpu(Some("vfio-pci"), Some(1));
+        // This must not touch /sys because we early-return.
+        gpu.bind_to_vfio_pci().unwrap();
+    }
 }

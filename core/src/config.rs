@@ -155,19 +155,25 @@ pub struct LookingGlassConfig {
 /// configuration policy remains separate from raw hardware scanning.
 /// ---------------------------------------------------------------------------
 pub mod pci {
+    use std::collections::HashMap;
+
     use super::{GpuPolicyConfig, VmConfig};
     use crate::errors::{ChalybsError, Result};
     use tracing::{info, warn};
 
-    use crate::pci::PciInventory;
+    use crate::pci::{GpuSafetyClass, GpuUnbindAssessment, GpuUnbindFeasibility, PciInventory};
 
-    /// GPU passthrough preflight policy:
+    /// GPU passthrough preflight policy (Phase 1/2/3):
     ///
     /// Rules:
     /// * If the VM has no configured GPU devices → nothing to enforce.
     /// * If host has 0 GPUs → error if VM requested one.
     /// * If host has 1 GPU → require allow_single_gpu = true.
     /// * If host has >=2 GPUs → always allowed.
+    ///
+    /// Phase 2/3 also logs driver classification and unbind feasibility,
+    /// but does not yet block beyond the single-GPU rules and "no GPUs"
+    /// condition.
     ///
     /// iGPUs count as "GPU candidates" only for *counting*, not for
     /// passthrough unless explicitly listed in devices.gpu[].
@@ -186,6 +192,82 @@ pub mod pci {
         // Build host PCI inventory.
         let inv = PciInventory::scan()?;
         let host_gpu_count = inv.count_display_controllers();
+
+        // Phase 2: GPU driver detection + safety classification (read-only).
+        let gpu_summaries = inv.gpu_summaries();
+        for s in &gpu_summaries {
+            info!(
+                bdf = s.bdf.as_str(),
+                vendor = format_args!("0x{:04x}", s.vendor_id),
+                device = format_args!("0x{:04x}", s.device_id),
+                driver = s.driver.as_deref().unwrap_or("<none>"),
+                driver_kind = ?s.driver_kind,
+                safety = ?s.safety,
+                "host GPU classification"
+            );
+        }
+
+        let host_owned = gpu_summaries
+            .iter()
+            .filter(|s| matches!(s.safety, Some(GpuSafetyClass::HostOwned)))
+            .count();
+
+        if host_owned > 0 {
+            warn!(
+                vm = vm_name,
+                host_owned_gpus = host_owned,
+                "GPU passthrough requested while some GPUs are classified as HostOwned \
+(bound to host GPU drivers); Phase 2 is detection-only, no policy change yet"
+            );
+        }
+
+        // Phase 3: unbind safety simulation (still read-only, no sysfs writes).
+        let unbind_assessments = inv.assess_gpu_unbind_safety();
+        for a in &unbind_assessments {
+            let group_members_str = if a.group_members.is_empty() {
+                "<none>".to_string()
+            } else {
+                a.group_members.join(",")
+            };
+
+            match &a.feasibility {
+                GpuUnbindFeasibility::Safe => {
+                    info!(
+                        vm = vm_name,
+                        bdf = a.bdf.as_str(),
+                        driver = a.current_driver.as_deref().unwrap_or("<none>"),
+                        safety_class = ?a.safety_class,
+                        iommu_group = ?a.iommu_group,
+                        group_members = group_members_str.as_str(),
+                        "GPU unbind simulation: SAFE"
+                    );
+                }
+                GpuUnbindFeasibility::Risky(reason) => {
+                    warn!(
+                        vm = vm_name,
+                        bdf = a.bdf.as_str(),
+                        driver = a.current_driver.as_deref().unwrap_or("<none>"),
+                        safety_class = ?a.safety_class,
+                        iommu_group = ?a.iommu_group,
+                        group_members = group_members_str.as_str(),
+                        reason = reason.as_str(),
+                        "GPU unbind simulation: RISKY"
+                    );
+                }
+                GpuUnbindFeasibility::Unsafe(reason) => {
+                    warn!(
+                        vm = vm_name,
+                        bdf = a.bdf.as_str(),
+                        driver = a.current_driver.as_deref().unwrap_or("<none>"),
+                        safety_class = ?a.safety_class,
+                        iommu_group = ?a.iommu_group,
+                        group_members = group_members_str.as_str(),
+                        reason = reason.as_str(),
+                        "GPU unbind simulation: UNSAFE"
+                    );
+                }
+            }
+        }
 
         if host_gpu_count == 0 {
             return Err(ChalybsError::Vfio(format!(
@@ -215,9 +297,110 @@ pub mod pci {
             )));
         }
 
-        // Future: we can insert iGPU-specific handling or IOMMU grouping checks.
+        // Future: we can insert iGPU-specific handling or more detailed
+        // gating from unbind feasibility here. For now, this remains
+        // advisory only.
 
         info!(vm = vm_name, "GPU policy satisfied; continuing startup");
+        Ok(())
+    }
+
+    /// Phase 4: Prepare PCI for GPU passthrough.
+    ///
+    /// Called from VmState::PreparePci, *after* preflight_gpu_policy()
+    /// has passed. This function:
+    ///
+    ///   * Resolves configured GPU devices against PCI inventory.
+    ///   * Reuses unbind safety assessments for those GPUs.
+    ///   * Blocks on "Unsafe" feasibility for configured GPUs.
+    ///   * Logs and proceeds on "Risky" per operator judgement.
+    ///   * Unbinds current drivers and binds GPUs to vfio-pci.
+    ///
+    /// This is the first phase that performs sysfs writes.
+    pub fn prepare_gpu_passthrough(vm_name: &str, cfg: &VmConfig) -> Result<()> {
+        let gpu_cfgs = match cfg.devices.gpu.as_ref() {
+            Some(v) if !v.is_empty() => v,
+            _ => {
+                info!(
+                    vm = vm_name,
+                    "no GPU devices configured; skipping PCI prepare"
+                );
+                return Ok(());
+            }
+        };
+
+        // Build host PCI inventory and resolve configured GPUs.
+        let inv = PciInventory::scan()?;
+        let resolved = inv.resolve_configured(gpu_cfgs)?;
+
+        // Build a BDF → assessment map from unbind safety simulation.
+        let assessments = inv.assess_gpu_unbind_safety();
+        let mut by_bdf: HashMap<&str, &GpuUnbindAssessment> = HashMap::new();
+        for a in &assessments {
+            by_bdf.insert(a.bdf.as_str(), a);
+        }
+
+        // Gate based on feasibility for configured GPUs.
+        for func in &resolved {
+            if !func.is_display_controller() {
+                return Err(ChalybsError::Vfio(format!(
+                    "VM {vm_name}: device {} in devices.gpu is not a display controller",
+                    func.bdf
+                )));
+            }
+
+            if let Some(a) = by_bdf.get(func.bdf.as_str()) {
+                match &a.feasibility {
+                    GpuUnbindFeasibility::Unsafe(reason) => {
+                        return Err(ChalybsError::Vfio(format!(
+                            "VM {vm_name}: GPU {} is classified as UNSAFE to unbind: {reason}",
+                            func.bdf
+                        )));
+                    }
+                    GpuUnbindFeasibility::Risky(reason) => {
+                        warn!(
+                            vm = vm_name,
+                            bdf = func.bdf.as_str(),
+                            iommu_group = ?a.iommu_group,
+                            reason = reason.as_str(),
+                            "GPU unbind classified as RISKY for configured GPU; \
+                             proceeding per operator configuration"
+                        );
+                    }
+                    GpuUnbindFeasibility::Safe => {
+                        info!(
+                            vm = vm_name,
+                            bdf = func.bdf.as_str(),
+                            "GPU unbind classified as SAFE for configured GPU; proceeding"
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    vm = vm_name,
+                    bdf = func.bdf.as_str(),
+                    "no unbind assessment found for configured GPU; treating as RISKY and proceeding"
+                );
+            }
+        }
+
+        // Perform unbind + vfio-pci bind for all configured GPUs.
+        for func in &resolved {
+            info!(
+                vm = vm_name,
+                bdf = func.bdf.as_str(),
+                "unbinding current driver for GPU prior to passthrough"
+            );
+            func.unbind_current_driver()?;
+
+            info!(
+                vm = vm_name,
+                bdf = func.bdf.as_str(),
+                "binding GPU to vfio-pci for passthrough"
+            );
+            func.bind_to_vfio_pci()?;
+        }
+
         Ok(())
     }
 }

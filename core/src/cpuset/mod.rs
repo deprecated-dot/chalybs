@@ -28,8 +28,7 @@ fn discover_numa_topology() -> Result<NumaTopology> {
     let node_root = Path::new("/sys/devices/system/node");
 
     // Always get the online CPU list.
-    let online_str =
-        fs::read_to_string("/sys/devices/system/cpu/online")?;
+    let online_str = fs::read_to_string("/sys/devices/system/cpu/online")?;
     let mut online_cpus = parse_cpu_list(online_str.trim())?;
     online_cpus.sort_unstable();
     online_cpus.dedup();
@@ -126,9 +125,9 @@ fn format_node_list(nodes: &BTreeSet<u32>) -> String {
 ///
 /// Implements C2:
 /// - If NUMA nodes are present:
-///     host_cpus = all CPUs on nodes NOT used by vm_cpus
+///   host_cpus = all CPUs on nodes NOT used by vm_cpus
 /// - If single-node:
-///     host_cpus = online_cpus - vm_cpus
+///   host_cpus = online_cpus - vm_cpus
 pub fn derive_host_cpus_from_topology(vm_cpus: &[u32]) -> Result<Vec<u32>> {
     if vm_cpus.is_empty() {
         return Err(ChalybsError::Cgroup(
@@ -146,8 +145,7 @@ pub fn derive_host_cpus_from_topology(vm_cpus: &[u32]) -> Result<Vec<u32>> {
     }
 
     // Identify host nodes: all nodes minus vm_nodes.
-    let mut host_nodes: BTreeSet<u32> =
-        topo.node_cpus.keys().copied().collect();
+    let mut host_nodes: BTreeSet<u32> = topo.node_cpus.keys().copied().collect();
     for n in &vm_nodes {
         host_nodes.remove(n);
     }
