@@ -1,41 +1,52 @@
 # Chalybs CHANGELOG
 
-## v0.3.3 — GPU Driver Detection, Unbind Safety Simulation, Unified Architecture Doc
+## v0.3.4 — Deterministic VFIO Staging & Verification (PCI Phase 5–6)
+**Release Date:** TBD
 
+### Added
+- **PCI Phase 5:** Deterministic VFIO action planning for all passthrough devices.
+- **PCI Phase 6:** Full VFIO execution + post-bind verification pipeline.
+- `vfio::stage_pci_devices_for_vm` integrated into VM state machine.
+- Strict ordering: all unbinds occur before all binds.
+- Deterministic and idempotent sysfs interaction (`unbind`, `bind`).
+
+### Changed
+- Improved internal documentation for VFIO execution behavior.
+- pci.rs corrected and restored to full baseline with clippy-clean strategy.
+- Safety model wiring aligned with earlier PCI phases.
+
+### Removed
+- None. No regressions or structural reductions.
+
+---
+
+## v0.3.3 — GPU Driver Detection, Unbind Safety Simulation, Unified Architecture Doc
 **Release Date:** TBD
 
 ### Added
 - **PCI Phase 2:** GPU driver detection and safety classification.
-- **PCI Phase 3:** Read‑only unbind feasibility simulation (IOMMU‑group aware).
-- **PCI Phase 4 foundation:** VFIO bind/unbind helper functions (no automation yet).
-- **Unified Super‑Doc:** `CHALYBS_EXECUTION_AND_ARCHITECTURE.md`
-  - Merged architecture, execution pipeline, NUMA model, PCI/GPU pipeline, and mode/capability structure.
-  - Replaces several scattered documents:
-    - `docs_pipeline.md`
-    - `PIPELINE_OVERVIEW.md`
-    - `docs_architecture.md`
-    - `MODE_CAPABILITY_ARCHITECTURE.md`
-    - `C2_NUMA_DERIVATION.md`
+- **PCI Phase 3:** Read-only unbind feasibility simulation (IOMMU-group aware).
+- **PCI Phase 4 foundation:** VFIO bind/unbind helper functions.
+- **Unified Super-Doc:** `CHALYBS_EXECUTION_AND_ARCHITECTURE.md`
 
 ### Changed
-- Minor cpuset documentation fixes for clippy compliance.
-- Topology/scanning and PCI policy paths clarified in state machine docs.
+- Minor cpuset documentation fixes for clippy.
+- Clarified PCI preflight flow in state machine docs.
 
 ### Removed
-- No code removed, but several old documents are now superseded by the unified doc.
+- Several superseded docs merged into unified architecture document.
 
 ---
 
 ## v0.3.2 — PCI Inventory & Policy Foundations
-- Full PCI inventory rebuilt from sysfs with robust error-handling.
-- PCI policy preflight wired into VM state machine.
-- Single-GPU safety enforcement implemented.
+- Full PCI inventory from sysfs.
+- Single-GPU safety rules.
+- PCI policy preflight integration.
 
 ## v0.3.1 — Initial QEMU Launch Pipeline
-- VM state machine implemented.
-- cpuset creation + teardown.
-- IRQ/MSI detection and pinning.
+- VM state machine.
+- cpuset, IRQ/MSI management.
 
-## v0.3.0 — Initial Project Resurrection & Refactor into Rust
-- Full crate reorganization.
-- Core modules established.
+## v0.3.0 — Project Resurrection & Rust Refactor
+- Reorganization.
+- Core crate structure established.

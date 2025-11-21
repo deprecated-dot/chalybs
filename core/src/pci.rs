@@ -221,6 +221,8 @@ impl PciFunction {
             "unbinding PCI function from current driver"
         );
 
+        // NOTE: we deliberately pass a reference here to avoid moving the
+        // PathBuf, since we still use it in the error path.
         fs::write(&driver_unbind_path, format!("{}\n", self.bdf)).map_err(|e| {
             ChalybsError::Vfio(format!(
                 "failed to write BDF {} to {} for unbind: {e}",
@@ -264,10 +266,55 @@ impl PciFunction {
             "binding PCI function to vfio-pci"
         );
 
+        // bind_path is a &Path; it already implements AsRef<Path>, so we can
+        // pass it directly without extra borrowing or hacks.
         fs::write(bind_path, format!("{}\n", self.bdf)).map_err(|e| {
             ChalybsError::Vfio(format!(
                 "failed to bind BDF {} to vfio-pci via {}: {e}",
                 self.bdf,
+                bind_path.display()
+            ))
+        })
+    }
+
+    /// Generic helper: bind this device to an arbitrary kernel driver
+    /// under `/sys/bus/pci/drivers/<driver>/bind`.
+    ///
+    /// If it is already bound to this driver (based on the inventory
+    /// snapshot), this is treated as a no-op.
+    pub fn bind_to_driver(&self, driver: &str) -> Result<()> {
+        if matches!(self.driver.as_deref(), Some(d) if d == driver) {
+            debug!(
+                bdf = self.bdf.as_str(),
+                driver, "PCI function already bound to requested driver; skipping bind"
+            );
+            return Ok(());
+        }
+
+        let bind_path = Path::new("/sys/bus/pci/drivers").join(driver).join("bind");
+
+        if !bind_path.exists() {
+            return Err(ChalybsError::Vfio(format!(
+                "driver bind path {} does not exist for `{driver}`; \
+                 ensure the module is loaded",
+                bind_path.display()
+            )));
+        }
+
+        debug!(
+            bdf = self.bdf.as_str(),
+            driver,
+            path = %bind_path.display(),
+            "binding PCI function to driver"
+        );
+
+        // Same rationale as unbind_current_driver(): keep ownership of the
+        // PathBuf so we can still use bind_path.display() in the error path.
+        fs::write(&bind_path, format!("{}\n", self.bdf)).map_err(|e| {
+            ChalybsError::Vfio(format!(
+                "failed to bind BDF {} to driver `{}` via {}: {e}",
+                self.bdf,
+                driver,
                 bind_path.display()
             ))
         })

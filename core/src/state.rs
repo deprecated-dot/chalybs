@@ -63,15 +63,16 @@ impl VmStateMachine {
                 VmState::PreparePci => {
                     info!("state=PreparePci");
 
-                    // Phase 5: perform VFIO staging for all PCI devices that
-                    // this VM wants to passthrough. This builds a VFIO action
-                    // plan and executes it (unbind current drivers, bind to
-                    // vfio-pci) before we reserve CPUs and launch QEMU.
+                    // Phase 5–7: perform VFIO staging for all PCI devices
+                    // that this VM wants to passthrough. This builds a VFIO
+                    // action plan and executes it (unbind current drivers,
+                    // bind to vfio-pci), recording original driver bindings
+                    // in VmRuntime for later restoration at shutdown.
                     //
                     // All safety policy is enforced earlier (e.g. single-GPU
                     // checks, unbind feasibility). Any failure here aborts
                     // before QEMU launch.
-                    crate::vfio::stage_pci_devices_for_vm(&self.rt)?;
+                    crate::vfio::stage_pci_devices_for_vm(&mut self.rt)?;
 
                     self.state = VmState::ReserveCpus;
                 }
@@ -148,6 +149,12 @@ impl VmStateMachine {
 
         info!("state=Shutdown");
         crate::qemu::shutdown(&mut self.rt)?;
+
+        // Phase 7: restore PCI driver bindings for all devices that were
+        // staged to vfio-pci for this VM. This is best-effort: failures
+        // are logged but do not abort shutdown.
+        info!("state=RestorePci");
+        crate::vfio::restore_pci_devices_for_vm(&self.rt)?;
 
         info!("state=Cleanup");
         crate::cpuset::destroy_cpuset(&mut self.rt)?;

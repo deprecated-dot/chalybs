@@ -32,17 +32,34 @@ pub struct QemuState {
     pub child: Child,
 }
 
+/// VFIO transition record for a single PCI device.
+///
+/// This captures the *original* driver binding before Chalybs staged
+/// the device for passthrough (i.e., before binding it to vfio-pci).
+#[derive(Debug, Clone)]
+pub struct VfioTransition {
+    /// PCI BDF, e.g. "0000:0b:00.0".
+    pub bdf: String,
+    /// Original bound driver name, if any (e.g. "amdgpu", "nvidia").
+    /// None means the device was originally unbound.
+    pub from_driver: Option<String>,
+}
+
 /// Unified runtime object passed through state machine
 #[derive(Debug)]
 pub struct VmRuntime {
     pub name: String,
-    pub cfg: VmConfig,         // Entire VM config
-    pub cpus: VmCpuLayout,     // Parsed CPU layout
+    pub cfg: VmConfig,     // Entire VM config
+    pub cpus: VmCpuLayout, // Parsed CPU layout
     pub cgroups: Option<CgroupPaths>,
     pub qemu: Option<QemuState>,
 
     pub pinned_threads: bool,
     pub pinned_irqs: bool,
+
+    /// VFIO driver transitions performed while staging PCI devices for
+    /// this VM. Used during shutdown to restore original bindings.
+    pub vfio_transitions: Vec<VfioTransition>,
 }
 
 impl VmRuntime {
@@ -55,6 +72,7 @@ impl VmRuntime {
             qemu: None,
             pinned_threads: false,
             pinned_irqs: false,
+            vfio_transitions: Vec::new(),
         }
     }
 
