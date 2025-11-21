@@ -43,6 +43,9 @@ pub struct VfioTransition {
     /// Original bound driver name, if any (e.g. "amdgpu", "nvidia").
     /// None means the device was originally unbound.
     pub from_driver: Option<String>,
+    /// IOMMU group id at the time of staging, if known. This is used
+    /// only for diagnostics and future ACS / domain-aware behavior.
+    pub iommu_group: Option<u32>,
 }
 
 /// Unified runtime object passed through state machine

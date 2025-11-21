@@ -51,6 +51,7 @@ pub fn execute_plan(
                     transitions.push(VfioTransition {
                         bdf: action.bdf.clone(),
                         from_driver: func.driver.clone(),
+                        iommu_group: func.iommu_group,
                     });
                 }
 
@@ -61,3 +62,4 @@ pub fn execute_plan(
 
     Ok(())
 }
+
