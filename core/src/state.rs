@@ -63,10 +63,15 @@ impl VmStateMachine {
                 VmState::PreparePci => {
                     info!("state=PreparePci");
 
-                    // Phase 4: perform PCI-side effects for GPU passthrough:
-                    // unbind current drivers and bind configured GPUs to
-                    // vfio-pci, subject to earlier feasibility checks.
-                    crate::config::pci::prepare_gpu_passthrough(&self.rt.name, &self.rt.cfg)?;
+                    // Phase 5: perform VFIO staging for all PCI devices that
+                    // this VM wants to passthrough. This builds a VFIO action
+                    // plan and executes it (unbind current drivers, bind to
+                    // vfio-pci) before we reserve CPUs and launch QEMU.
+                    //
+                    // All safety policy is enforced earlier (e.g. single-GPU
+                    // checks, unbind feasibility). Any failure here aborts
+                    // before QEMU launch.
+                    crate::vfio::stage_pci_devices_for_vm(&self.rt)?;
 
                     self.state = VmState::ReserveCpus;
                 }
