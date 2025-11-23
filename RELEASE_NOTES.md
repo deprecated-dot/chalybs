@@ -1,7 +1,10 @@
 # Chalybs v0.4.0 Release Notes
 
 > **Status:** In development / working tree  
-> **Focus:** Device isolation policy (Phase 8) and architecture alignment
+> **Focus:** Device isolation policy (Phase 8) and architecture alignment  
+> **Note:** `IsolationLevel` and `default_level` are present in configuration
+> examples as **reserved / future fields**, but are **not yet implemented** in
+> the v0.4.0 codebase. They will be added early in the next development cycle.
 
 This release consolidates PCI/VFIO phases and introduces **Phase 8: Device
 Isolation Policy**, while keeping existing configurations backward compatible by
@@ -20,7 +23,8 @@ Key features:
 
 - Per-VM `isolation` block with:
   - `mode = "disabled" | "audit" | "enforce"`
-  - `default_level = "dedicated" | "shared_with_host" | "forbidden"` (intent hint)
+  - `default_level = "dedicated" | "shared_with_host" | "forbidden"`  
+    **(reserved field: not active in this release)**
   - Boolean toggles:
     - `require_iommu_exclusive`
     - `require_multifunction_consistency`
@@ -42,10 +46,10 @@ The internal PCI/VFIO pipeline is now fully documented as **Phases 1–8**:
 2. GPU driver classification  
 3. Unbind safety simulation  
 4. VFIO sysfs helpers  
-5. VFIO action plan (plan)  
-6. VFIO binding verification (verify)  
-7. Deterministic VFIO restore (shutdown)  
-8. Device isolation policy (audit/enforce)  
+5. VFIO action plan  
+6. VFIO binding verification  
+7. Deterministic VFIO restore  
+8. Device isolation policy  
 
 The regenerated `CHALYBS_EXECUTION_AND_ARCHITECTURE.md` is now the canonical
 reference for:
@@ -66,7 +70,7 @@ Each VM may now define:
 ```toml
 [vm.win11-gpu.isolation]
 mode = "audit"                    # "disabled" | "audit" | "enforce"
-default_level = "dedicated"       # "dedicated" | "shared_with_host" | "forbidden"
+default_level = "dedicated"       # reserved (not implemented in v0.4.0)
 
 require_iommu_exclusive = true
 require_multifunction_consistency = true
@@ -76,7 +80,7 @@ forbid_host_critical_in_group = true
 Defaults if the block is omitted:
 
 - `mode = "disabled"`
-- `default_level = "dedicated"`
+- `default_level = "dedicated"` (reserved + unused)
 - All booleans default to `true`.
 
 Result: existing configurations behave exactly as they did in v0.3.x.
@@ -155,6 +159,8 @@ force_use_igpu = false
 
 Planned areas for the next minor releases:
 
+- **Implementation of `IsolationLevel` and `default_level`**  
+  (currently reserved / no-op in v0.4.0)
 - Multi-GPU policy (iGPU/dGPU arbitration, per-GPU overrides).
 - More nuanced isolation levels (per-device, per-class).
 - NUMA/IRQ advisors and “what-if” analysis.
