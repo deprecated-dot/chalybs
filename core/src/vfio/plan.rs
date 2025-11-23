@@ -4,9 +4,7 @@ use tracing::debug;
 
 use crate::config::{PciDeviceConfig, VmConfig};
 use crate::errors::{ChalybsError, Result};
-use crate::pci::{
-    GpuUnbindAssessment, GpuUnbindFeasibility, PciFunction, PciInventory,
-};
+use crate::pci::{GpuUnbindAssessment, GpuUnbindFeasibility, PciFunction, PciInventory};
 
 /// Kind of VFIO action to perform on a given PCI function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,24 +37,17 @@ pub struct VfioPlan {
 ///
 /// This is a pure function: it does not touch sysfs. All side effects are
 /// performed later by `execute_plan`.
-pub fn build_plan_for_vm(
-    vm_name: &str,
-    cfg: &VmConfig,
-    inv: &PciInventory,
-) -> Result<VfioPlan> {
+pub fn build_plan_for_vm(vm_name: &str, cfg: &VmConfig, inv: &PciInventory) -> Result<VfioPlan> {
     let mut unbind_actions: Vec<VfioAction> = Vec::new();
     let mut bind_actions: Vec<VfioAction> = Vec::new();
 
     // 1) GPU handling: respect GPU unbind feasibility classification.
     build_gpu_actions(vm_name, cfg, inv, &mut unbind_actions, &mut bind_actions)?;
 
-    // 2) Non-GPU PCI devices: NVMe, NIC, USB. For now these have no
-    //    special safety model; we assume that if the user configured
-    //    them for passthrough, we attempt to stage them.
+    // 2) Non-GPU PCI devices.
     build_non_gpu_actions(vm_name, cfg, inv, &mut unbind_actions, &mut bind_actions)?;
 
-    // Order: all unbinds first, then binds. This minimizes the chance of
-    // transient conflicts between drivers.
+    // Order: all unbinds first, then binds.
     let mut actions = Vec::new();
     actions.extend(unbind_actions);
     actions.extend(bind_actions);
@@ -75,10 +66,10 @@ pub fn build_plan_for_vm(
 
 /// Build actions for configured GPUs, using GPU unbind feasibility.
 ///
-/// Policy for now:
-/// - Safe  → allowed; may result in no-op if already vfio-bound.
-/// - Risky → error; future versions may allow overrides.
-/// - Unsafe → error.
+/// Policy:
+/// - Safe   → allowed.
+/// - Risky  → hard-error.
+/// - Unsafe → hard-error.
 fn build_gpu_actions(
     vm_name: &str,
     cfg: &VmConfig,
@@ -88,10 +79,7 @@ fn build_gpu_actions(
 ) -> Result<()> {
     let gpu_cfgs: &[PciDeviceConfig] = match cfg.devices.gpu.as_ref() {
         Some(list) => list.as_slice(),
-        None => {
-            // No GPUs requested; nothing to do.
-            return Ok(());
-        }
+        None => return Ok(()),
     };
 
     if gpu_cfgs.is_empty() {
@@ -100,7 +88,7 @@ fn build_gpu_actions(
 
     let gpu_funcs = inv.resolve_configured(gpu_cfgs)?;
 
-    // Build a map of BDF -> GpuUnbindAssessment.
+    // Build BDF → assessment map.
     let assessments = inv.assess_gpu_unbind_safety();
     let mut by_bdf: HashMap<&str, &GpuUnbindAssessment> = HashMap::new();
     for a in &assessments {
@@ -121,22 +109,9 @@ fn build_gpu_actions(
 
         match &assessment.feasibility {
             GpuUnbindFeasibility::Safe => {
-                // Safe to unbind from its current driver (if any) and
-                // bind to vfio-pci. In practice this will most often be
-                // already bound to vfio-pci, in which case both actions
-                // become no-ops at execution time.
-                append_actions_for_function(
-                    vm_name,
-                    "GPU",
-                    func,
-                    unbind_actions,
-                    bind_actions,
-                );
+                append_actions_for_function(vm_name, "GPU", func, unbind_actions, bind_actions);
             }
             GpuUnbindFeasibility::Risky(msg) => {
-                // For now we fail hard on Risky, until a config flag is
-                // added to permit override. This keeps Phase 5 behavior
-                // conservative by default.
                 return Err(ChalybsError::Vfio(format!(
                     "VM {vm_name}: GPU {bdf} is classified as RISKY to unbind: {msg}"
                 )));
@@ -153,10 +128,6 @@ fn build_gpu_actions(
 }
 
 /// Build actions for non-GPU PCI devices (NVMe, NIC, USB).
-///
-/// These currently have no special safety model: if they are configured
-/// for passthrough and not already bound to vfio-pci, we plan to unbind
-/// from the current driver (if any) and bind to vfio-pci.
 fn build_non_gpu_actions(
     vm_name: &str,
     cfg: &VmConfig,
@@ -194,11 +165,7 @@ fn build_non_gpu_actions(
     Ok(())
 }
 
-/// Shared helper: append unbind/bind actions for a single PCI function.
-///
-/// If the device is already bound to vfio-pci, this will *only* enqueue
-/// a BindToVfio action; the underlying implementation will treat that
-/// as a no-op.
+/// Append unbind/bind actions for a single PCI function.
 fn append_actions_for_function(
     vm_name: &str,
     kind_label: &str,
@@ -209,7 +176,7 @@ fn append_actions_for_function(
     let bdf = func.bdf.clone();
     let driver = func.driver.as_deref();
 
-    // If the device has a current driver and it's not vfio-pci, unbind.
+    // If device has a current driver and it's not vfio-pci → unbind.
     if let Some(d) = driver {
         if d != "vfio-pci" {
             unbind_actions.push(VfioAction {
@@ -223,19 +190,15 @@ fn append_actions_for_function(
         }
     }
 
-    // Always plan a bind-to-vfio step; PciFunction::bind_to_vfio_pci() is
-    // idempotent when already vfio-bound.
+    // Always enqueue a bind-to-vfio step (idempotent).
     bind_actions.push(VfioAction {
         bdf,
         kind: VfioActionKind::BindToVfio,
-        reason: format!(
-            "{kind_label} device bound to vfio-pci for VM {vm_name}"
-        ),
+        reason: format!("{kind_label} device bound to vfio-pci for VM {vm_name}"),
     });
 }
 
-/// Shared helper: build actions for a list of configured devices of a
-/// given kind (NVMe, NIC, USB).
+/// Stage all configured devices of a kind (NVMe, NIC, USB).
 fn stage_device_list(
     vm_name: &str,
     kind_label: &str,
@@ -252,13 +215,7 @@ fn stage_device_list(
     let funcs = inv.resolve_configured(cfgs)?;
 
     for func in funcs {
-        append_actions_for_function(
-            vm_name,
-            kind_label,
-            func,
-            unbind_actions,
-            bind_actions,
-        );
+        append_actions_for_function(vm_name, kind_label, func, unbind_actions, bind_actions);
     }
 
     Ok(())
@@ -268,7 +225,7 @@ fn stage_device_list(
 mod tests {
     use super::*;
     use crate::config::{
-        CpuConfig, DevicesConfig, GpuPolicyConfig, NumaConfig, QemuConfig,
+        CpuConfig, DevicesConfig, GpuPolicyConfig, IsolationPolicyConfig, NumaConfig, QemuConfig,
     };
 
     fn minimal_vm_config_with_gpu(bdf: &str) -> VmConfig {
@@ -300,6 +257,7 @@ mod tests {
                 allow_single_gpu: false,
                 force_use_igpu: false,
             },
+            isolation: IsolationPolicyConfig::default(),
             peripherals: None,
         }
     }
@@ -330,9 +288,7 @@ mod tests {
 
         let plan = build_plan_for_vm(vm_name, &cfg, &inv).unwrap();
 
-        // For a GPU already bound to vfio-pci and in an isolated group,
-        // we expect at most a single BindToVfio action (which is a no-op
-        // at execution time).
+        // For a GPU already vfio-bound and isolated, expect ≤1 bind action.
         assert!(plan.actions.len() <= 1);
         if let Some(action) = plan.actions.get(0) {
             assert_eq!(action.bdf, bdf);

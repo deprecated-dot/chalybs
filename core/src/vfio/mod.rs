@@ -10,8 +10,15 @@
 //! High-level entrypoints for the state machine:
 //!   - vfio::stage_pci_devices_for_vm(&mut VmRuntime)
 //!   - vfio::restore_pci_devices_for_vm(&VmRuntime)
+//!
+//! Phases covered here:
+//!   - Phase 5: VFIO action plan builder + execution
+//!   - Phase 6: VFIO post-execution verification
+//!   - Phase 7: VFIO restoration (deterministic teardown)
+//!   - Phase 8: Device isolation policy gate (IOMMU-group focused)
 
 mod execute;
+mod isolation;
 mod plan;
 mod verify;
 
@@ -91,14 +98,15 @@ impl RestoreSummary {
 /// Stage all PCI devices required by this VM for passthrough:
 ///
 /// 1. Build a VFIO action plan from VM config + PCI inventory.
-/// 2. Execute the plan (unbind current drivers, bind to vfio-pci),
+/// 2. Run the Phase 8 isolation policy gate for this VM.
+/// 3. Execute the plan (unbind current drivers, bind to vfio-pci),
 ///    recording the original driver bindings in the VmRuntime.
-/// 3. Re-scan PCI inventory and verify that all configured passthrough
+/// 4. Re-scan PCI inventory and verify that all configured passthrough
 ///    devices are now bound to vfio-pci.
 ///
 /// This function is called from VmState::PreparePci.
 pub fn stage_pci_devices_for_vm(rt: &mut VmRuntime) -> Result<()> {
-    // Phase 5: plan + execute.
+    // Phase 5: plan.
     let inv = PciInventory::scan()?;
     let plan = build_plan_for_vm(&rt.name, &rt.cfg, &inv)?;
 
@@ -108,8 +116,16 @@ pub fn stage_pci_devices_for_vm(rt: &mut VmRuntime) -> Result<()> {
         "vfio: staging PCI devices for VM"
     );
 
-    // Execute the plan and record original driver bindings so we can
-    // restore them during shutdown.
+    // Phase 8: device isolation policy gate.
+    //
+    // This is a pure, read-only check that consumes VmConfig and the
+    // current PCI inventory. Depending on the per-VM isolation mode,
+    // violations are either logged (Audit) or treated as hard errors
+    // (Enforce). In Disabled mode, this is a no-op.
+    isolation::evaluate_isolation_for_vm(&rt.name, &rt.cfg, &inv)?;
+
+    // Phase 5: execute the plan and record original driver bindings so
+    // we can restore them during shutdown.
     execute_plan(&plan, &inv, &mut rt.vfio_transitions)?;
 
     // Phase 6: verification — ensure all configured passthrough devices

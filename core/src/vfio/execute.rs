@@ -10,7 +10,7 @@ use super::{VfioActionKind, VfioPlan};
 ///
 /// This performs the actual sysfs writes by delegating to the
 /// PciFunction helpers in `pci.rs`. Any driver transitions that would
-/// need to be restored later are recorded into `transitions`.
+/// need to be restored during teardown are recorded into `transitions`.
 pub fn execute_plan(
     plan: &VfioPlan,
     inv: &PciInventory,
@@ -32,8 +32,10 @@ pub fn execute_plan(
                     reason = action.reason.as_str(),
                     "vfio: unbinding device from current driver"
                 );
+
                 func.unbind_current_driver()?;
             }
+
             VfioActionKind::BindToVfio => {
                 info!(
                     vm = plan.vm_name.as_str(),
@@ -42,11 +44,10 @@ pub fn execute_plan(
                     "vfio: binding device to vfio-pci"
                 );
 
-                // Record the original driver binding *before* we bind to
-                // vfio-pci, so that shutdown can restore it later.
+                // Record original driver ONLY if the current driver is not vfio-pci.
                 //
-                // If the device is already bound to vfio-pci in this
-                // inventory snapshot, there is nothing to restore.
+                // If it is already vfio-bound in this inventory snapshot, there is no
+                // original binding to restore and thus no transition should be recorded.
                 if !matches!(func.driver.as_deref(), Some("vfio-pci")) {
                     transitions.push(VfioTransition {
                         bdf: action.bdf.clone(),
@@ -62,4 +63,3 @@ pub fn execute_plan(
 
     Ok(())
 }
-

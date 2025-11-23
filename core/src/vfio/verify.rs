@@ -16,22 +16,18 @@ use crate::pci::{PciFunction, PciInventory};
 /// Public entrypoint: verify that all configured passthrough devices
 /// for this VM are now bound to vfio-pci.
 ///
-/// This performs a fresh PCI inventory scan and delegates to the
-/// internal `verify_with_inventory` to keep tests hermetic.
+/// This performs a fresh PCI inventory scan and delegates to
+/// `verify_with_inventory` to keep tests hermetic.
 pub fn verify_vm_vfio_bindings(vm_name: &str, cfg: &VmConfig) -> Result<()> {
     let inv = PciInventory::scan()?;
     verify_with_inventory(vm_name, cfg, &inv)
 }
 
 /// Internal helper: verify bindings using a provided inventory.
-/// This is exposed to tests but not re-exported from the module tree.
-fn verify_with_inventory(
-    vm_name: &str,
-    cfg: &VmConfig,
-    inv: &PciInventory,
-) -> Result<()> {
-    // GPUs: must be present and bound to vfio-pci, and must actually be
-    // display controllers (defensive check against config mistakes).
+/// Exposed to tests but not re-exported at the module root.
+fn verify_with_inventory(vm_name: &str, cfg: &VmConfig, inv: &PciInventory) -> Result<()> {
+    // GPUs: must be present, be actual display controllers, and be
+    // bound to vfio-pci.
     verify_device_list(
         vm_name,
         "GPU",
@@ -40,8 +36,7 @@ fn verify_with_inventory(
         Some(DeviceKind::Gpu),
     )?;
 
-    // Non-GPU devices: NVMe, NIC, USB — currently we only require that
-    // they resolve and are bound to vfio-pci if present.
+    // Generic PCI devices: NVMe, NIC, USB.
     verify_device_list(
         vm_name,
         "NVMe",
@@ -70,21 +65,19 @@ fn verify_with_inventory(
         vm = vm_name,
         "vfio: verified vfio-pci bindings for all configured passthrough devices"
     );
-
     Ok(())
 }
 
-/// Logical kind of device, used for additional sanity checks.
+/// Logical kind of device — used for extra defensive checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceKind {
-    /// GPU-like device (display controller). Must have base class 0x03.
+    /// A GPU or GPU-like PCI device (class 0x03xxxx).
     Gpu,
-    /// Any other PCI function we treat generically.
+    /// Generic PCI passthrough device.
     Generic,
 }
 
-/// Shared verification logic for a list of configured devices of a
-/// given kind (GPU, NVMe, NIC, USB).
+/// Verify a device category (GPU, NVMe, NIC, USB).
 fn verify_device_list(
     vm_name: &str,
     kind_label: &str,
@@ -97,8 +90,9 @@ fn verify_device_list(
         _ => return Ok(()),
     };
 
-    // resolve_configured() enforces presence for required devices and
-    // skips optional devices that are missing.
+    // resolve_configured() enforces required= true semantics and skips
+    // optional devices that are missing. This ensures we only verify
+    // devices that "exist" in this inventory context.
     let funcs = inv.resolve_configured(cfgs)?;
 
     for func in funcs {
@@ -108,7 +102,7 @@ fn verify_device_list(
     Ok(())
 }
 
-/// Verify a single PCI function's binding.
+/// Verify one PCI function: correct class (for GPUs) and vfio-pci binding.
 fn verify_single_device(
     vm_name: &str,
     kind_label: &str,
@@ -117,9 +111,8 @@ fn verify_single_device(
 ) -> Result<()> {
     let bdf = func.bdf.as_str();
 
+    // Additional defensive checks for GPU entries.
     if let Some(DeviceKind::Gpu) = kind {
-        // Defensive check: ensure the device really is a display
-        // controller; catch miswired configs early.
         if !func.is_display_controller() {
             return Err(ChalybsError::Vfio(format!(
                 "VM {vm_name}: device {bdf} configured as GPU, \
@@ -153,7 +146,8 @@ fn verify_single_device(
 mod tests {
     use super::*;
     use crate::config::{
-        CpuConfig, DevicesConfig, GpuPolicyConfig, NumaConfig, QemuConfig,
+        CpuConfig, DevicesConfig, GpuPolicyConfig, IsolationPolicyConfig, NumaConfig,
+        PciDeviceConfig, QemuConfig,
     };
 
     fn minimal_vm_config_for_devices(
@@ -167,8 +161,7 @@ mod tests {
                 None
             } else {
                 Some(
-                    bdfs
-                        .iter()
+                    bdfs.iter()
                         .map(|bdf| PciDeviceConfig {
                             pci_address: (*bdf).to_string(),
                             required: true,
@@ -203,6 +196,7 @@ mod tests {
                 allow_single_gpu: false,
                 force_use_igpu: false,
             },
+            isolation: IsolationPolicyConfig::default(),
             peripherals: None,
         }
     }
@@ -236,18 +230,10 @@ mod tests {
         let gpu_bdf = "0000:01:00.0";
         let nvme_bdf = "0000:02:00.0";
 
-        let cfg = minimal_vm_config_for_devices(
-            &[gpu_bdf],
-            &[nvme_bdf],
-            &[],
-            &[],
-        );
+        let cfg = minimal_vm_config_for_devices(&[gpu_bdf], &[nvme_bdf], &[], &[]);
 
         let inv = PciInventory {
-            functions: vec![
-                make_gpu_vfio(gpu_bdf),
-                make_nvme_vfio(nvme_bdf),
-            ],
+            functions: vec![make_gpu_vfio(gpu_bdf), make_nvme_vfio(nvme_bdf)],
         };
 
         verify_with_inventory("testvm", &cfg, &inv).unwrap();
@@ -277,6 +263,50 @@ mod tests {
         assert!(
             msg.contains("expected `vfio-pci`"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_with_inventory_fails_if_gpu_class_not_display() {
+        let gpu_bdf = "0000:01:00.0";
+        let cfg = minimal_vm_config_for_devices(&[gpu_bdf], &[], &[], &[]);
+
+        // Misconfigured: marked as GPU in config, but class is NIC-like.
+        let func = PciFunction {
+            bdf: gpu_bdf.to_string(),
+            vendor_id: 0x1234,
+            device_id: 0xabcd,
+            class: 0x020000, // network controller, not display
+            driver: Some("vfio-pci".to_string()),
+            iommu_group: Some(10),
+            numa_node: Some(0),
+        };
+
+        let inv = PciInventory {
+            functions: vec![func],
+        };
+
+        let err = verify_with_inventory("testvm", &cfg, &inv).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("configured as GPU") && msg.contains("class base is not 0x03"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_with_inventory_fails_if_required_gpu_missing_from_inventory() {
+        let gpu_bdf = "0000:05:00.0";
+        let cfg = minimal_vm_config_for_devices(&[gpu_bdf], &[], &[], &[]);
+
+        // Inventory is *empty* — required GPU does not resolve.
+        let inv = PciInventory { functions: vec![] };
+
+        // We don't care about exact error text, only that this is an error.
+        let res = verify_with_inventory("testvm", &cfg, &inv);
+        assert!(
+            res.is_err(),
+            "expected error when required GPU is missing from inventory"
         );
     }
 }

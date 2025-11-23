@@ -1,76 +1,81 @@
-# Chalybs Execution & Architecture (v0.3.3)
+# Chalybs Execution & Architecture (v0.4.0)
 
-> **Scope:** This document is the authoritative reference for how Chalybs 0.3.3
-> executes a VM from configuration to steady‑state, with a focus on:
+> **Authoritative architecture reference for Chalybs v0.4.0**
 >
-> - Execution pipeline and state machine
-> - PCI / GPU / VFIO architecture (Phases 1–4 complete)
-> - NUMA‑aware CPU derivation and cpuset layout (C2)
-> - Mode / capability architecture and safety policy surfaces
+> This document describes:
+> - End-to-end VM execution pipeline
+> - Deterministic state machine
+> - PCI / GPU / VFIO architecture (Phases 1–8 complete)
+> - NUMA-aware CPU isolation (C2 policy)
+> - Device isolation policy (Phase 8)
+> - System layout and future direction
 
-For release history and user‑facing changes, see `CHANGELOG.md` and
-`RELEASE_NOTES.md`. For roadmap details beyond 0.3.3, see `ROADMAP.md`.
+For change history, see `CHANGELOG.md`.  
+For release details, see `RELEASE_NOTES.md`.  
+For future plans, see `ROADMAP.md`.
 
 ---
 
-## 1. High‑Level System Architecture
+## 1. System Overview
 
-Chalybs is split into three main artifacts:
+Chalybs is a deterministic virtualization orchestrator with:
 
-- `chalybs-core` – library with:
-  - configuration model
-  - state machine
-  - PCI / VFIO / NUMA / cpuset logic
-  - QEMU launch and shutdown helpers
-- `chalybs` – CLI frontend that:
-  - loads `chalybs.toml`
-  - builds a `VmRuntime`
-  - drives the `VmStateMachine`
-- `chalybsd` – (future) daemon that:
-  - will expose IPC / control plane
-  - will orchestrate long‑lived VM lifecycles
+- Rust-native, sysfs-driven PCI/VFIO control
+- Deterministic VM bring-up and teardown
+- NUMA-aware CPU / IRQ orchestration
+- Safety policy layers for GPU and PCI passthrough
 
-### 1.1 High‑Level Flow
+It is composed of:
+
+| Component      | Purpose                                                           |
+|----------------|-------------------------------------------------------------------|
+| `chalybs-core` | Library containing state machine, configs, PCI/VFIO logic         |
+| `chalybs`      | CLI wrapper around core                                           |
+| `chalybsd`     | (Future) daemon with control-plane API and long-lived VM lifecycles |
+
+---
+
+## 2. High-Level Architecture
+
+### 2.1 Top-Level Flow
 
 ```mermaid
 flowchart LR
     subgraph CLI["chalybs (CLI)"]
-        A[Parse CLI args] --> B[Load config.toml]
+        A[Parse CLI args] --> B[Load chalybs.toml]
         B --> C[Build VmRuntime]
         C --> D[Create VmStateMachine]
         D --> E[run_until_steady()]
     end
 
     subgraph CORE["chalybs-core"]
-        E --> F[State machine\nValidate → Steady]
+        E --> F[State machine\nPrepare → Steady]
         F --> G[VM steady-state]
         G --> H[run_shutdown()]
     end
 
     subgraph QEMU["QEMU process"]
-        F -.spawn.-> Q[QEMU binary]
+        F -.spawn.-> Q[QEMU process]
         H -.teardown.-> QX[QEMU exit]
     end
 ```
 
-The core of Chalybs is the `VmStateMachine`, which progresses the VM through a
-deterministic sequence of states from `Init` to `Steady`, then through an
-orderly shutdown.
+The central coordinator is the state machine in `core/src/state.rs`, which drives
+a VM from initial validation through steady-state and back down through shutdown
+and VFIO restore.
 
 ---
 
-## 2. VM Execution Pipeline (State Machine)
+## 3. VM Execution Pipeline (State Machine)
 
-The VM lifecycle is encoded in `core/src/state.rs` as a small, explicit state
-machine.
-
-### 2.1 State Diagram
+### 3.1 State Diagram
 
 ```mermaid
 stateDiagram-v2
     [*] --> Init
     Init --> Validate
-    Validate --> ReserveCpus
+    Validate --> PreparePci
+    PreparePci --> ReserveCpus
     ReserveCpus --> LaunchQemu
     LaunchQemu --> DetectThreads
     DetectThreads --> PinVcpus
@@ -85,77 +90,105 @@ stateDiagram-v2
     Idle --> [*]
 ```
 
-### 2.2 State Responsibilities
+### 3.2 State Responsibilities
 
 - **Init**
-  - Initial entry; no side effects.
+  - Pure entry state; no side effects.
+
 - **Validate**
   - Validate configuration and host environment:
-    - CPU set consistency (`cpuset::preflight`)
-    - QEMU binary and arguments (`qemu::preflight`)
-    - PCI / GPU safety policy (`config::pci::preflight_gpu_policy`)
+    - Top-level `RootConfig` sanity (`RootConfig::validate`)
+    - cpuset preflight (`cpuset::preflight`)
+    - QEMU binary + arguments (`qemu::preflight`)
+    - GPU policy preflight:
+      - `config::pci::preflight_gpu_policy(vm_name, &VmConfig)`
+
+- **PreparePci** (Phases 5–8)
+  - Build host PCI inventory (`PciInventory::scan`).
+  - Build VFIO staging plan (Phase 5).
+  - Evaluate device isolation policy (Phase 8):
+    - `vfio::isolation::evaluate_isolation_for_vm(vm_name, &VmConfig, &PciInventory)`
+  - Execute VFIO plan (Phase 5) using sysfs helpers (Phase 4).
+  - Verify final VFIO bindings (Phase 6).
+
 - **ReserveCpus**
-  - Create and configure cgroup v2 cpusets for:
+  - Derive host CPUs using C2 policy (NUMA-aware).
+  - Create cpuset hierarchy:
     - `vfio_vm` (VM vCPUs)
-    - `vfio_host` (host CPUs not used by the VM)
-  - See section **3 – NUMA & C2 Host CPU Derivation**.
+    - `vfio_host` (remaining host CPUs)
+
 - **LaunchQemu**
-  - Spawn QEMU with the configured:
-    - CPU topology
-    - memory size
-    - OVMF images
-    - additional arguments / devices
+  - Spawn QEMU with configured:
+    - vCPU topology and count
+    - guest memory
+    - OVMF CODE/VARS
+    - additional devices / arguments from config
+
 - **DetectThreads**
-  - Wait for QEMU threads to appear.
-  - Discover vCPU thread IDs.
+  - Wait for QEMU vCPU threads to appear.
+  - Discover vCPU `tid`s.
+
 - **PinVcpus**
-  - Affinitize VM vCPU threads to the configured `vm_cpus`.
+  - Set CPU affinity for vCPU threads to `vm_cpus`.
+
 - **DetectMsi**
-  - Wait for MSI/MSI‑X IRQs to be registered.
+  - Wait for MSI/MSI-X IRQs to be allocated.
+
 - **PinIrqs**
-  - Affinitize VM IRQs to the appropriate CPU sets.
+  - Assign IRQ affinities according to host/VM layout.
+
 - **PeripheralHooks**
-  - Apply peripheral integration (Tasmota, DDC, Looking Glass, etc.)
-  - Ensure that host‑side peripherals follow VM lifecycle.
+  - Apply peripheral actions (if configured):
+    - Tasmota power control
+    - DDC input switching
+    - Looking Glass shared memory
+  - Ensure host-side peripherals follow VM lifecycle.
+
 - **Steady**
-  - VM is fully up, CPUs and IRQs pinned, peripherals configured.
-- **Shutdown / Cleanup / Idle**
-  - Tear down QEMU, cpusets, and peripherals as needed.
-  - Currently cpuset teardown is non‑destructive (directories left in place).
+  - VM is fully up; CPUs and IRQs pinned; peripherals configured.
+
+- **Shutdown**
+  - Tear down QEMU process.
+  - Perform deterministic VFIO restore (Phase 7) for all passthrough devices.
+
+- **Cleanup**
+  - Remove / reset cpusets.
+  - Perform any remaining cleanup needed to bring the system back to idle.
+
+- **Idle**
+  - Terminal state after shutdown; no resources held.
 
 ---
 
-## 3. NUMA & C2 Host CPU Derivation
+## 4. CPU & NUMA Architecture (C2 Policy)
 
-Chalybs uses a NUMA‑aware policy (C2) to derive host CPUs when the user does
-not explicitly specify them. This ensures that the host workload is kept off
-the NUMA nodes that back the guest vCPUs whenever possible.
+Chalybs uses a NUMA-aware policy (C2) to derive host CPUs when the user does not
+explicitly override them. The main goal is to keep host workloads away from the
+NUMA domains backing the guest vCPUs.
 
-### 3.1 Topology Discovery
+### 4.1 Topology Discovery
 
-Topology is discovered from sysfs:
+Topology comes from sysfs:
 
-- `/sys/devices/system/cpu/online` → full online CPU set
-- `/sys/devices/system/node/nodeN/cpulist` → per‑node CPU sets
+- `/sys/devices/system/cpu/online`
+- `/sys/devices/system/node/nodeN/cpulist`
 
-This is wrapped by an internal `NumaTopology` structure with:
+An internal `NumaTopology` abstraction exposes:
 
 - `node_cpus: BTreeMap<u32, Vec<u32>>`
 - `online_cpus: Vec<u32>`
 
-If no NUMA nodes are present, Chalybs collapses this to a single node (0)
-containing all online CPUs.
+If no NUMA nodes exist, Chalybs collapses the topology into a single synthetic
+node (0) containing all online CPUs.
 
-### 3.2 C2 Host CPU Derivation
-
-The core logic lives in `derive_host_cpus_from_topology(vm_cpus: &[u32])`:
+### 4.2 C2 Host CPU Derivation
 
 ```mermaid
 flowchart TD
     A[vm_cpus] --> B[discover_numa_topology()]
     B --> C[vm_nodes = nodes_for_cpus(vm_cpus)]
     C --> D{vm_nodes empty?}
-    D -->|yes| E[Error: topology inconsistent]
+    D -->|yes| E[Error: inconsistent topology]
     D -->|no| F[host_nodes = all_nodes - vm_nodes]
     F --> G{host_nodes non-empty?}
     G -->|yes| H[host_cpus = CPUs on host_nodes]
@@ -166,55 +199,60 @@ flowchart TD
 
 Summary:
 
-- If NUMA nodes exist and at least one node is not used by `vm_cpus`:
-  - `host_cpus` = all CPUs on those unused nodes.
-- Otherwise (single node, or VM consumes all nodes):
-  - `host_cpus` = `online_cpus` \ `vm_cpus`.
+- If there are nodes not referenced by `vm_cpus`:
+  - Host CPUs = all CPUs on those nodes.
+- Otherwise:
+  - Host CPUs = `online_cpus - vm_cpus`.
 
-If the derived `host_cpus` set is empty, Chalybs errors out rather than
-creating an unusable host cpuset.
+If `host_cpus` is empty, Chalybs errors rather than building a useless host
+cpuset.
 
-### 3.3 cpuset Layout
+### 4.3 cpuset Layout
 
-During `create_cpuset(rt: &mut VmRuntime)`:
+During cpuset creation:
 
 - `vfio_vm` cpuset:
   - `cpuset.cpus` = `vm_cpus`
   - `cpuset.mems` = NUMA nodes for `vm_cpus`
 - `vfio_host` cpuset:
-  - `cpuset.cpus` = `host_cpus`
+  - `cpuset.cpus` = derived `host_cpus`
   - `cpuset.mems` = NUMA nodes for `host_cpus`
 
-This establishes a clear separation of compute domains for the VM and host.
+This cleanly separates VM and host CPU/memory domains.
 
 ---
 
-## 4. PCI / GPU / VFIO Architecture (Phases 1–4)
+## 5. PCI / GPU / VFIO Phases
 
-Chalybs models PCI in two layers:
+Chalybs decomposes PCI/VFIO handling into eight phases:
 
-1. **Inventory (what exists)** – `core/src/pci.rs`
-2. **Policy (what is allowed)** – `core/src/config.rs::pci`
+```mermaid
+flowchart TD
+    P1[Phase 1: Inventory] --> P2[Phase 2: GPU driver classification]
+    P2 --> P3[Phase 3: Unbind safety simulation]
+    P3 --> P4[Phase 4: VFIO sysfs helpers]
+    P4 --> P5[Phase 5: VFIO action plan]
+    P5 --> P6[Phase 6: VFIO binding verification]
+    P6 --> P7[Phase 7: Deterministic VFIO restore]
+    P7 --> P8[Phase 8: Device isolation policy]
+```
 
-The philosophy is:
+At v0.4.0, **all eight phases are implemented**.
 
-- Inventory is deterministic, sysfs‑only, read‑only.
-- Policy consumes inventory and takes responsibility for safety decisions.
+### 5.1 Phase 1: Inventory (`core/src/pci.rs`)
 
-### 4.1 PCI Inventory
-
-The PCI inventory scanner builds a list of `PciFunction` structures from
+`PciInventory::scan()` builds a vector of `PciFunction` values from
 `/sys/bus/pci/devices/*`:
 
-- `bdf: String` – BDF like `0000:0b:00.0`
+- `bdf: String` – `0000:0b:00.0`
 - `vendor_id: u16`
 - `device_id: u16`
 - `class: u32` – raw class code (e.g., `0x030000` for VGA)
-- `driver: Option<String>` – bound driver name (`vfio-pci`, `amdgpu`, ...)
+- `driver: Option<String>` – bound driver (`vfio-pci`, `amdgpu`, ...)
 - `iommu_group: Option<u32>`
 - `numa_node: Option<i32>`
 
-Helper methods classify devices by purpose:
+Helpers:
 
 - `is_display_controller()`
 - `is_network_controller()`
@@ -222,75 +260,42 @@ Helper methods classify devices by purpose:
 - `is_nvme()`
 - `is_usb_controller()`
 
-The `PciInventory` type provides:
+Inventory-level grouping:
 
-- `scan()` – build full inventory from sysfs
-- `gpus()` / `nics()` / `nvmes()` / `usb_controllers()`
-- `by_iommu_group()` – map `group_id → Vec<&PciFunction>`
-- `resolve_configured()` – map config BDFs to `PciFunction`s
+- `by_iommu_group() -> HashMap<u32, Vec<&PciFunction>>`
+- Convenience filters for GPU/NVMe/NIC/USB subsets
+- `resolve_configured(&[PciDeviceConfig]) -> Result<Vec<&PciFunction>>`
 
-### 4.2 GPU Driver & Safety Classification (Phase 2)
+All of this is **read-only** and strictly from sysfs.
 
-For display controllers (`class_base == 0x03`), Chalybs classifies GPUs by
-bound kernel driver:
+### 5.2 Phase 2: GPU Driver & Safety Classification
+
+For display controllers, Chalybs assigns:
 
 ```rust
 enum GpuDriverKind {
     Vfio,
     AmdGpu,       // amdgpu or radeon
-    Nvidia,       // proprietary
-    Nouveau,      // open-source
+    Nvidia,       // proprietary NVIDIA
+    Nouveau,      // open-source NVIDIA
     OtherKernel(String),
     Unbound,
 }
-```
 
-Safety classification:
-
-```rust
 enum GpuSafetyClass {
-    VfioReady,    // bound to vfio-pci
+    VfioReady,    // already bound to vfio-pci
     HostOwned,    // bound to amdgpu/nvidia/nouveau
     Unknown,      // unbound or unknown driver
 }
 ```
 
-Phase 2 is read‑only and purely descriptive. It enables:
+`PciInventory::gpu_summaries()` provides a summarized view for logging and
+policy evaluation. This is still read-only.
 
-- accurate GPU counts for single‑GPU safety policy
-- better logging and introspection
-- later phases (3–5) to operate on structured classifications instead of
-  driver strings.
+### 5.3 Phase 3: Unbind Safety Simulation
 
-### 4.3 PCI Policy: Single‑GPU Safety (Phase 2)
-
-The GPU policy lives in `config.rs::pci` and is driven by `GpuPolicyConfig`:
-
-```rust
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct GpuPolicyConfig {
-    pub allow_single_gpu: bool,
-    pub force_use_igpu: bool, // reserved for future use
-}
-```
-
-The core check is `preflight_gpu_policy(vm_name, &VmConfig)`:
-
-- If VM has **no GPU devices** configured:
-  - Preflight is a no‑op.
-- If host has **0 GPUs** (by class code):
-  - Error if VM requested one.
-- If host has **1 GPU**:
-  - Require `allow_single_gpu = true`, or abort with a clear message.
-- If host has **≥ 2 GPUs**:
-  - Always allowed (additional policies may be added later).
-
-Phase 2 also logs GPU summaries (driver, safety) to aid operator decisions.
-
-### 4.4 Unbind Safety Simulation (Phase 3)
-
-Phase 3 adds a way to *simulate* unbind safety for GPUs without actually
-touching sysfs.
+Chalybs simulates what would happen if it unbound a GPU from its current driver,
+without touching sysfs:
 
 ```rust
 enum GpuUnbindFeasibility {
@@ -304,31 +309,22 @@ struct GpuUnbindAssessment {
     pub current_driver: Option<String>,
     pub safety_class: GpuSafetyClass,
     pub iommu_group: Option<u32>,
-    pub group_members: Vec<String>, // other BDFs in same group
+    pub group_members: Vec<String>,
     pub feasibility: GpuUnbindFeasibility,
 }
 ```
 
-`PciInventory::assess_gpu_unbind_safety()`:
-
-- Groups devices by IOMMU group.
-- For each GPU:
-  - Looks at its safety class.
-  - Looks at all devices in its IOMMU group.
-  - Assigns `Safe` / `Risky` / `Unsafe`.
-
 Heuristics:
 
 - No IOMMU group → `Unsafe("no IOMMU group")`
-- Group contains non‑GPU devices or host‑owned GPUs → `Risky(...)`
-- Group contains only vfio‑bound / unbound GPUs → `Safe`
+- Group contains host-owned GPUs or mixed device classes → `Risky(...)`
+- Group contains only vfio-bound/unbound GPUs → `Safe`
 
-This remains **read‑only**. It is used for operator introspection and as the
-basis for Phase 5.
+Used as input to Phase 5 planning.
 
-### 4.5 VFIO Bind/Unbind Plumbing (Phase 4)
+### 5.4 Phase 4: Minimal VFIO Helpers
 
-Phase 4 introduces minimal but correct VFIO sysfs helpers:
+Minimal, deterministic sysfs helpers on `PciFunction`:
 
 ```rust
 impl PciFunction {
@@ -340,112 +336,321 @@ impl PciFunction {
 Behavior:
 
 - `unbind_current_driver()`:
-  - If `driver.is_none()` → no‑op.
-  - Otherwise writes BDF to:
-    - `/sys/bus/pci/drivers/<driver>/unbind`
+  - If no driver → no-op.
+  - Else write BDF to `/sys/bus/pci/drivers/<driver>/unbind`.
+
 - `bind_to_vfio_pci()`:
-  - If already bound to `vfio-pci` → no‑op.
-  - Otherwise writes BDF to:
-    - `/sys/bus/pci/drivers/vfio-pci/bind`
+  - If already `vfio-pci` → no-op.
+  - Else write BDF to `/sys/bus/pci/drivers/vfio-pci/bind`.
 
-These helpers do **not** encode policy and are not yet wired into the state
-machine. They are the building blocks for Phase 5.
+These helpers encode **no policy**, only mechanics.
 
-### 4.6 PCI/GPU/VFIO Flow Overview
+### 5.5 Phase 5: VFIO Action Plan (Plan)
+
+Phase 5 constructs an ordered list of VFIO operations (a “plan”) per VM:
+
+- Input:
+  - VM config (`VmConfig`)
+  - PCI inventory (`PciInventory`)
+  - GPU unbind assessments (Phase 3)
+- Output:
+  - Sequence of operations:
+    - Unbind GPU drivers
+    - Unbind other devices (NVMe/NIC/USB)
+    - Bind all configured devices to `vfio-pci`
+
+The planner remains pure (no sysfs), producing an in-memory plan that is later
+executed by the VFIO executor.
+
+### 5.6 Phase 6: VFIO Binding Verification (Verify)
+
+After executing the plan, Chalybs verifies that reality matches intent:
+
+- Re-scan inventory.
+- Confirm that all configured passthrough devices are:
+  - Present
+  - Bound to `vfio-pci`
+- On mismatch:
+  - Emit detailed diagnostics.
+  - Fail VM startup before QEMU launch.
+
+### 5.7 Phase 7: Deterministic VFIO Restore (Shutdown)
+
+On shutdown:
+
+- Chalybs re-scans inventory.
+- Computes a **restore plan**:
+  - For each device, restore its original driver (if any).
+  - Skip devices that were originally unbound or vfio-bound.
+- Executes restore in a deterministic order (usually GPU → NVMe → NIC → USB).
+- Optionally performs a PCI bus rescan (configurable).
+
+The restore path is purely mechanical and does not involve policy decisions.
+
+---
+
+## 6. Phase 8: Device Isolation Policy
+
+Phase 8 introduces a per-VM device isolation policy:
+
+```rust
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationMode {
+    Disabled,
+    Audit,
+    Enforce,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationLevel {
+    Dedicated,
+    SharedWithHost,
+    Forbidden,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+pub struct IsolationPolicyConfig {
+    pub mode: IsolationMode,
+    pub default_level: IsolationLevel,
+    pub require_iommu_exclusive: bool,
+    pub require_multifunction_consistency: bool,
+    pub forbid_host_critical_in_group: bool,
+}
+```
+
+### 6.1 Isolation Modes
+
+```mermaid
+flowchart LR
+    D[Disabled] -->|no isolation checks| R[Proceed]
+    A[Audit] -->|log findings only| R
+    E[Enforce] -->|abort on violations| X[Error: VM startup blocked]
+```
+
+- **Disabled**
+  - Skip Phase 8; behavior matches pre-Phase-8 Chalybs.
+- **Audit**
+  - Evaluate isolation; log findings as info/warnings; never block.
+- **Enforce**
+  - Treat violations as hard errors; fail before any VFIO sysfs writes.
+
+Defaults:
+
+- `mode = Disabled`
+- `default_level = Dedicated`
+- All booleans default to `true`.
+
+### 6.2 Checks Performed
+
+Phase 8 currently implements three checks via `evaluate_isolation_for_vm`:
+
+1. **IOMMU Group Exclusivity**
+
+   If `require_iommu_exclusive = true`:
+
+   - For each IOMMU group containing any passthrough device:
+     - If the same group contains non-passthrough devices:
+       - Emit violation `IOMMU_GROUP_NOT_EXCLUSIVE`.
+
+2. **Multifunction Consistency**
+
+   If `require_multifunction_consistency = true`:
+
+   - Group devices by `(domain, bus, slot)` (i.e. multi-function group).
+   - If some functions are passthrough and some are host-owned:
+     - Emit violation `MULTIFUNCTION_MIXED_OWNERSHIP`.
+
+3. **Host-Critical GPU Sharing**
+
+   If `forbid_host_critical_in_group = true`:
+
+   - For each IOMMU group with passthrough devices:
+     - If the same group contains a GPU classified as `HostOwned`
+       (amdgpu/nvidia/nouveau):
+       - Emit violation `HOST_CRITICAL_GPU_SHARED_GROUP`.
+
+### 6.3 Findings Model
+
+Each check produces `IsolationFinding` values:
+
+```rust
+pub enum IsolationSeverity {
+    Info,
+    Warning,
+    Violation,
+}
+
+pub struct IsolationFinding {
+    pub severity: IsolationSeverity,
+    pub code: &'static str,
+    pub message: String,
+    pub device_bdf: Option<String>,
+    pub iommu_group: Option<u32>,
+}
+
+pub struct IsolationReport {
+    pub vm_name: String,
+    pub findings: Vec<IsolationFinding>,
+}
+```
+
+Logging behavior:
+
+- All findings are logged with structured fields.
+- Severity is reflected in tracing level (`info` vs `warn`).
+
+Enforcement behavior:
+
+- `IsolationMode::Disabled` → report is ignored.
+- `IsolationMode::Audit` → log only.
+- `IsolationMode::Enforce` → if any `Violation` exists:
+  - Count them.
+  - Fail VM startup with a clear error message.
+
+### 6.4 Evaluation Flow
 
 ```mermaid
 flowchart TD
-    A[Inventory scan\nPciInventory::scan()] --> B[Classify GPUs\nGpuDriverKind]
-    B --> C[Safety class\nGpuSafetyClass]
-    C --> D[Unbind feasibility\nassess_gpu_unbind_safety()]
-    D --> E[(Future) Driver transition plan\nPhase 5+]
-    E --> F[(Future) Apply transitions\nunbind_current_driver + bind_to_vfio_pci]
+    A[VmConfig + PciInventory] --> B[Collect passthrough devices]
+    B --> C[Build passthrough BDF set]
+    C --> D[Check IOMMU exclusivity]
+    C --> E[Check multifunction consistency]
+    C --> F[Check host-critical GPU sharing]
+    D --> G[Aggregate findings]
+    E --> G
+    F --> G
+    G --> H[Log report]
+    H --> I{mode == Enforce & has violations?}
+    I -->|no| J[Proceed to VFIO plan/execute]
+    I -->|yes| K[Abort with ChalybsError::Vfio]
 ```
 
-At v0.3.3, the pipeline is complete through node **D** and the helper APIs for
-node **F** are implemented, but no automatic transitions are performed.
+Phase 8 is purely above the VFIO plan/execute/verify stages. If Enforce-mode
+violations exist, **no sysfs writes occur**.
 
 ---
 
-## 5. Mode & Capability Architecture
+## 7. Configuration Surfaces
 
-Chalybs is moving toward a “mode + capabilities” model where:
+### 7.1 RootConfig
 
-- **Modes** describe high‑level user intent (e.g. "PCI‑strict",
-  "performance‑biased").
-- **Capabilities** describe what the host can safely do (e.g. "multi‑GPU with
-  isolated IOMMU group", "NUMA‑aware cpusets available").
+```rust
+pub struct RootConfig {
+    pub vm: HashMap<String, VmConfig>,
+    pub logging: Option<LoggingConfig>,
+}
+```
 
-In 0.3.3, this architecture is partially realized through:
+- `vm` is a map `name → VmConfig` (e.g. `vm.win11-gpu`).
+- `logging` controls global logging output.
 
-- `VmConfig`:
-  - `cpu`, `qemu`, `numa`, `devices`, `gpu`, `peripherals`
-- `GpuPolicyConfig`:
-  - `allow_single_gpu`, `force_use_igpu` (placeholder)
-- Implicit capabilities derived from:
-  - PCI inventory
-  - IOMMU group layout
-  - NUMA topology
-  - availability of vfio‑pci and its sysfs endpoints
+### 7.2 VmConfig Highlights
 
-Future versions will surface explicit mode names and capability checks, but
-the foundational work is already present in the PCI and NUMA subsystems.
+```rust
+pub struct VmConfig {
+    pub cpu: CpuConfig,
+    pub qemu: QemuConfig,
+    pub numa: Option<NumaConfig>,
+    pub devices: DevicesConfig,
+    pub gpu: GpuPolicyConfig,
+    pub isolation: IsolationPolicyConfig,
+    pub peripherals: Option<PeripheralConfig>,
+}
+```
 
----
+Key fields:
 
-## 6. Peripheral Architecture (Hooks)
-
-Peripherals are modeled in `PeripheralConfig`:
-
-- `tasmota` – smart‑plug power control
-- `ddc` – display input switching
-- `looking_glass` – shared memory for low‑latency display
-
-These are activated in the `PeripheralHooks` state:
-
-- After CPUs and IRQs are pinned.
-- Before declaring the VM `Steady`.
-
-The design intent is that **peripherals track VM lifecycle**, and can
-eventually be extended into a full “peripheral scene graph” that follows
-modes/capabilities and VM profiles.
+- `cpu` – vCPU mapping (`host_cpus`, `vm_cpus`)
+- `qemu` – binary path, args, vCPU count, memory, OVMF images
+- `numa` – preferred NUMA node for vCPUs / IRQs
+- `devices` – GPU, NVMe, NIC, USB pass-through lists
+- `gpu` – single-GPU safety and future GPU policy toggles
+- `isolation` – Phase 8 device isolation policy
+- `peripherals` – Tasmota, DDC, Looking Glass wiring
 
 ---
 
-## 7. Future Directions (Post‑0.3.3 Sketch)
+## 8. Peripheral Execution Model
 
-While this document is anchored at v0.3.3, the architecture is deliberately
-shaped to support:
+Peripherals are configured via `PeripheralConfig` and applied in the
+`PeripheralHooks` state after CPU/IRQ pinning:
 
-- **Phase 5 – Driver Transition Orchestration**
-  - Integrate unbind/bind planning into `VmState::Validate`.
-  - Provide clear, auditable logs for every driver transition.
-  - Offer a dry‑run mode for “show me what would happen”.
+- **Tasmota** – VM-aware power control for the host or attached equipment.
+- **DDC** – Display input switching for host/VM.
+- **Looking Glass** – Shared memory for low-latency VM display.
 
-- **Phase 6 – VFIO/IOMMU Policy Engine**
-  - Configurable policies for what counts as “safe enough” to proceed.
-  - Hard gates against unbinding GPUs that are clearly host‑critical.
-
-- **Phase 7 – Multi‑GPU Runtime Control**
-  - Runtime GPU switching.
-  - Rebind to host drivers on VM shutdown.
-  - Better cooperation with display managers and compositor stacks.
-
-- **Beyond**
-  - Richer cpuset / NUMA policies.
-  - Disk and network QoS via cgroup v2.
-  - A mature daemon (`chalybsd`) with first‑class IPC and UI integration.
+Peripherals are expected to evolve into a richer “scene graph” but are
+already lifecycle-aware in v0.4.0.
 
 ---
 
-## 8. Summary
+## 9. End-to-End Bring-Up & Shutdown
 
-Chalybs 0.3.3 establishes a solid, test‑backed foundation for:
+### 9.1 Bring-Up (Simplified)
 
-- Deterministic VM execution via a small, explicit state machine.
-- NUMA‑aware CPU and cpuset organization (C2 policy).
-- PCI inventory and GPU safety modeling through well‑factored phases.
-- Read‑only unbind feasibility analysis and VFIO plumbing that is ready
-  to be integrated into future policy‑driven phases.
+```mermaid
+sequenceDiagram
+    participant C as CLI
+    participant S as StateMachine
+    participant P as PCI/VFIO
+    participant Q as QEMU
 
-This document is the canonical reference for how those pieces fit together.
+    C->>S: run_until_steady()
+    S->>S: Init → Validate
+    S->>P: GPU policy preflight (Phase 1–3)
+    S->>P: PCI prepare (Phase 5–8)
+    P->>P: build VFIO plan
+    P->>P: evaluate isolation
+    P->>P: execute VFIO plan
+    P->>P: verify VFIO bindings
+    S->>S: ReserveCpus
+    S->>Q: LaunchQemu
+    S->>S: DetectThreads → PinVcpus
+    S->>S: DetectMsi → PinIrqs
+    S->>S: PeripheralHooks
+    S->>C: Steady
+```
+
+### 9.2 Shutdown (Simplified)
+
+```mermaid
+sequenceDiagram
+    participant S as StateMachine
+    participant P as PCI/VFIO
+    participant Q as QEMU
+
+    S->>Q: Shutdown QEMU
+    S->>P: restore_pci_devices_for_vm() (Phase 7)
+    P->>P: restore original drivers
+    S->>S: Cleanup → Idle
+```
+
+---
+
+## 10. Future Direction (v0.4.x → v1.0)
+
+Planned evolutions:
+
+- Richer isolation policies (per-device overrides, class-based rules).
+- Multi-GPU arbitration and policy (iGPU/dGPU selection).
+- NUMA/IRQ advisor with “what-if” simulations.
+- A full daemon (`chalybsd`) with control-plane and UI integration.
+- “Hardened mode” that further constrains nondeterministic behaviors.
+
+---
+
+## 11. Summary
+
+Chalybs v0.4.0 delivers:
+
+- A clear, deterministic VM state machine.
+- NUMA-aware CPU and IRQ placement (C2 policy).
+- A complete, testable PCI/VFIO pipeline (Phases 1–8).
+- Device isolation policy with Disabled/Audit/Enforce modes.
+- Deterministic VFIO restore on shutdown.
+- Extensible configuration surfaces aligned with future growth.
+
+This document is the canonical reference for how those pieces fit together in
+v0.4.0.

@@ -30,6 +30,17 @@ pub struct VmConfig {
     #[serde(default)]
     pub gpu: GpuPolicyConfig,
 
+    /// Device isolation policy (Phase 8).
+    ///
+    /// This controls whether Chalybs enforces IOMMU-group based
+    /// isolation for all passthrough devices (GPU, NVMe, NIC, USB).
+    ///
+    /// By default, isolation is **disabled** so existing configs
+    /// continue to behave as before. Operators may opt into `Audit`
+    /// or `Enforce` modes on a per-VM basis.
+    #[serde(default)]
+    pub isolation: IsolationPolicyConfig,
+
     #[serde(default)]
     pub peripherals: Option<PeripheralConfig>,
 }
@@ -116,6 +127,103 @@ pub struct GpuPolicyConfig {
     /// Currently unused; kept for forward-compatible config.
     #[serde(default)]
     pub force_use_igpu: bool,
+}
+
+/// Isolation mode for device safety (Phase 8).
+///
+/// - Disabled → no additional checks; behavior is identical to
+///   earlier versions of Chalybs.
+/// - Audit    → evaluate isolation and log findings, but do not
+///   block startup.
+/// - Enforce  → treat any isolation violation as a hard error and
+///   abort VFIO staging before touching sysfs.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationMode {
+    Disabled,
+    Audit,
+    Enforce,
+}
+
+/// Desired isolation level for passthrough devices.
+///
+/// At present this is used as an intent signal for diagnostics; it
+/// allows future per-device overrides. For now, the default level is
+/// Dedicated, which pairs naturally with strict IOMMU-group checks.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationLevel {
+    Dedicated,
+    SharedWithHost,
+    Forbidden,
+}
+
+/// Per-VM device isolation policy (Phase 8).
+///
+/// This is intentionally conservative by default (Disabled mode) so
+/// existing VM configurations behave exactly as before. Operators can
+/// opt into Audit or Enforce for stricter guarantees around IOMMU
+/// isolation and host-critical device sharing.
+#[derive(Debug, Deserialize, Clone, Copy)]
+pub struct IsolationPolicyConfig {
+    /// Overall isolation mode for this VM.
+    ///
+    /// Default: Disabled (no behavior change vs pre-Phase-8).
+    #[serde(default = "default_isolation_mode")]
+    pub mode: IsolationMode,
+
+    /// Default isolation level for passthrough devices that do not
+    /// have an explicit override in future configuration surfaces.
+    ///
+    /// Currently this is used only as an intent hint and logged as
+    /// part of the isolation evaluation path.
+    #[serde(default = "default_isolation_level")]
+    pub default_level: IsolationLevel,
+
+    /// If true (default), any IOMMU group that contains at least one
+    /// passthrough device must not contain non-passthrough members.
+    ///
+    /// Violations are either logged (Audit) or treated as hard errors
+    /// (Enforce).
+    #[serde(default = "default_true")]
+    pub require_iommu_exclusive: bool,
+
+    /// If true (default), multi-function PCI devices (same domain/bus/
+    /// slot, different function) are expected to be treated as a unit.
+    /// If some functions are passed through while others remain on the
+    /// host, an isolation finding is emitted.
+    #[serde(default = "default_true")]
+    pub require_multifunction_consistency: bool,
+
+    /// If true (default), passthrough from an IOMMU group that also
+    /// contains a host-owned GPU (e.g. amdgpu/nvidia/nouveau) is
+    /// treated as a violation.
+    #[serde(default = "default_true")]
+    pub forbid_host_critical_in_group: bool,
+}
+
+fn default_isolation_mode() -> IsolationMode {
+    IsolationMode::Disabled
+}
+
+fn default_isolation_level() -> IsolationLevel {
+    IsolationLevel::Dedicated
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for IsolationPolicyConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_isolation_mode(),
+            default_level: default_isolation_level(),
+            require_iommu_exclusive: default_true(),
+            require_multifunction_consistency: default_true(),
+            forbid_host_critical_in_group: default_true(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

@@ -1,44 +1,111 @@
-[vm.default]
-name = "win11-gpu"
-qemu_binary = "/usr/bin/qemu-system-x86_64"
-ovmf_code = "/usr/share/OVMF/OVMF_CODE.fd"
-ovmf_vars = "/var/lib/chalybs/win11_ovmf_vars.fd"
-memory_mb = 32768
-hugepages = true
-num_vcpus = 16
+# Example Chalybs configuration for v0.4.0
+#
+# This file is intended as a realistic but minimal starting point. It shows:
+# - New VmConfig layout (cpu/qemu/devices/gpu/isolation/peripherals)
+# - Single-GPU safety policy
+# - Per-VM isolation policy (Phase 8)
 
-[vm.default.cpu]
+[vm.win11-gpu.cpu]
+# Host CPUs reserved for the VM vCPUs (host CPU IDs).
 host_cpus = "0-7,32-39"
+
+# vCPU indices exposed to the guest.
 vm_cpus   = "8-15,40-47"
 
-[vm.default.numa]
+[vm.win11-gpu.qemu]
+binary   = "/usr/bin/qemu-system-x86_64"
+args     = "-machine type=q35,accel=kvm -display none"
+num_vcpus = 16
+mem_mb    = 32768
+hugepages = true
+
+ovmf_code = "/usr/share/OVMF/OVMF_CODE.fd"
+ovmf_vars = "/var/lib/chalybs/win11_ovmf_vars.fd"
+
+[vm.win11-gpu.numa]
+# Prefer placing vCPUs / IRQs on this NUMA node.
 node = 1
 
-[[vm.default.devices.gpu]]
+# ----------------------------
+# PCI passthrough devices
+# ----------------------------
+
+[[vm.win11-gpu.devices.gpu]]
 pci_address = "0000:0a:00.0"
-required = true
+required    = true
 
-[[vm.default.devices.nvme]]
+[[vm.win11-gpu.devices.nvme]]
 pci_address = "0000:0b:00.0"
-required = true
+required    = true
 
-[[vm.default.devices.nic]]
+[[vm.win11-gpu.devices.nic]]
 pci_address = "0000:0c:00.0"
-required = false
+required    = false
 
-[vm.default.peripherals.tasmota]
-url = "http://tasmota-kvm.local/cm"
-on_command = "Power ON"
+# ----------------------------
+# GPU policy (single-GPU safety)
+# ----------------------------
+
+[vm.win11-gpu.gpu]
+# If false (default), Chalybs will refuse to passthrough a GPU on a host
+# that has exactly one GPU. Set to true only if you understand that the
+# host display may be stolen.
+allow_single_gpu = false
+
+# Reserved for future behavior (e.g., “prefer iGPU for host display”).
+force_use_igpu = false
+
+# ----------------------------
+# Device isolation policy (Phase 8)
+# ----------------------------
+
+[vm.win11-gpu.isolation]
+# Overall isolation mode:
+#   "disabled" - no additional checks (backwards compatible).
+#   "audit"    - log isolation findings, never block startup.
+#   "enforce"  - treat violations as hard errors.
+mode = "audit"
+
+# Intent hint for future policy expansions:
+#   "dedicated"        - device should be dedicated to this VM.
+#   "shared_with_host" - sharing is acceptable if explicitly configured.
+#   "forbidden"        - passthrough not allowed by policy.
+default_level = "dedicated"
+
+# If true, any IOMMU group that contains passthrough devices must not contain
+# non-passthrough members (violation: IOMMU_GROUP_NOT_EXCLUSIVE).
+require_iommu_exclusive = true
+
+# If true, multi-function PCI devices (same domain/bus/slot, different
+# function) should be treated as a unit. Mixing host-owned and passthrough
+# functions is flagged as a violation.
+require_multifunction_consistency = true
+
+# If true, passthrough from an IOMMU group that also contains a host-owned
+# GPU (amdgpu/nvidia/nouveau) is treated as a violation.
+forbid_host_critical_in_group = true
+
+# ----------------------------
+# Peripherals (optional)
+# ----------------------------
+
+[vm.win11-gpu.peripherals.tasmota]
+url         = "http://tasmota-kvm.local/cm"
+on_command  = "Power ON"
 off_command = "Power OFF"
 
-[vm.default.peripherals.ddc]
+[vm.win11-gpu.peripherals.ddc]
 monitor_i2c_bus = 4
-vm_input = 2
-host_input = 1
+vm_input        = 2
+host_input      = 1
 
-[vm.default.peripherals.looking_glass]
+[vm.win11-gpu.peripherals.looking_glass]
 shm_name = "looking-glass"
 
+# ----------------------------
+# Global logging
+# ----------------------------
+
 [logging]
-level = "info"
-format = "pretty"
+level  = "info"   # "trace" | "debug" | "info" | "warn" | "error"
+format = "pretty" # "pretty" | "json"
