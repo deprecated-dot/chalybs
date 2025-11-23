@@ -1,3 +1,5 @@
+// core/src/vfio/isolation.rs
+
 use std::collections::{HashMap, HashSet};
 
 use tracing::{info, warn};
@@ -488,6 +490,7 @@ mod tests {
                 gpu: Some(vec![PciDeviceConfig {
                     pci_address: bdf.to_string(),
                     required: true,
+                    level: None,
                 }]),
                 nvme: None,
                 nic: None,

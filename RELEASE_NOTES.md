@@ -1,167 +1,84 @@
-# Chalybs v0.4.0 Release Notes
+# Chalybs v0.4.1 Release Notes
 
-> **Status:** In development / working tree  
-> **Focus:** Device isolation policy (Phase 8) and architecture alignment  
-> **Note:** `IsolationLevel` and `default_level` are present in configuration
-> examples as **reserved / future fields**, but are **not yet implemented** in
-> the v0.4.0 codebase. They will be added early in the next development cycle.
-
-This release consolidates PCI/VFIO phases and introduces **Phase 8: Device
-Isolation Policy**, while keeping existing configurations backward compatible by
-default.
+> **Status:** Released  
+> **Primary Focus:** Isolation Level enforcement (Phase 9), stabilization of PciDeviceConfig, and alignment of VFIO pipeline.
 
 ---
 
 ## 1. Highlights
 
-### 1.1 Phase 8: Device Isolation Policy
+### 1.1 Phase 9: Isolation Level Enforcement (New)
 
-Chalybs can now evaluate and (optionally) enforce device isolation constraints
-before performing any VFIO sysfs operations.
+`IsolationLevel` is now active:
 
-Key features:
+- `dedicated` — device must be isolated from host-owned peers.
+- `shared_with_host` — sharing acceptable, warnings possible.
+- `forbidden` — passthrough prohibited.
 
-- Per-VM `isolation` block with:
-  - `mode = "disabled" | "audit" | "enforce"`
-  - `default_level = "dedicated" | "shared_with_host" | "forbidden"`  
-    **(reserved field: not active in this release)**
-  - Boolean toggles:
-    - `require_iommu_exclusive`
-    - `require_multifunction_consistency`
-    - `forbid_host_critical_in_group`
-- Detailed findings model:
-  - `Info`, `Warning`, `Violation` severities
-  - Codes for each violation type
-  - BDF and IOMMU group tagging in logs
-- Modes:
-  - **disabled** — no behavior change vs prior releases.
-  - **audit** — log findings, never block startup.
-  - **enforce** — block VM startup when violations exist.
+Levels can be applied:
 
-### 1.2 Architecture & Docs Aligned With Reality
+- Globally per-VM (`default_level`)
+- Per-device via `PciDeviceConfig.level`
 
-The internal PCI/VFIO pipeline is now fully documented as **Phases 1–8**:
+Phase 9 runs after Phase 8 (mode-based policy) and before any VFIO sysfs writes.
 
-1. Inventory  
-2. GPU driver classification  
-3. Unbind safety simulation  
-4. VFIO sysfs helpers  
-5. VFIO action plan  
-6. VFIO binding verification  
-7. Deterministic VFIO restore  
-8. Device isolation policy  
+### 1.2 Structural Fixes
 
-The regenerated `CHALYBS_EXECUTION_AND_ARCHITECTURE.md` is now the canonical
-reference for:
+- Corrected struct-shape drift that caused missing-field test failures.
+- Synchronized `PciDeviceConfig` across:
+  - planner
+  - verifier
+  - isolation (policy + level)
+  - configuration ingestion
 
-- State machine behavior
-- NUMA-aware CPU/IRQ placement (C2)
-- PCI/GPU/VFIO phases
-- Isolation semantics
+### 1.3 Full Green State
+
+- `cargo build` — clean  
+- `cargo clippy` — clean  
+- `cargo test` — **100% pass**  
+
+This is the most stable release of the 0.4.x line.
 
 ---
 
 ## 2. Configuration Changes
 
-### 2.1 New `isolation` Block
-
-Each VM may now define:
+### Active fields:
 
 ```toml
-[vm.win11-gpu.isolation]
-mode = "audit"                    # "disabled" | "audit" | "enforce"
-default_level = "dedicated"       # reserved (not implemented in v0.4.0)
+[vm.<name>.isolation]
+mode = "audit"
+default_level = "dedicated"
 
 require_iommu_exclusive = true
 require_multifunction_consistency = true
 forbid_host_critical_in_group = true
 ```
 
-Defaults if the block is omitted:
-
-- `mode = "disabled"`
-- `default_level = "dedicated"` (reserved + unused)
-- All booleans default to `true`.
-
-Result: existing configurations behave exactly as they did in v0.3.x.
-
-### 2.2 Updated Example Configuration
-
-`chalybs.example.toml` has been updated to:
-
-- Use the `vm.<name>.cpu` / `vm.<name>.qemu` / `vm.<name>.devices` layout
-  that matches `VmConfig`.
-- Show explicit `gpu` policy:
+Per-device override:
 
 ```toml
-[vm.win11-gpu.gpu]
-allow_single_gpu = false
-force_use_igpu = false
+[[vm.<name>.devices.gpu]]
+pci_address = "0000:03:00.0"
+required = true
+level = "shared_with_host"
 ```
 
-- Show explicit `isolation` policy (see above).
-- Retain logging configuration (`[logging]`).
+Defaults remain backward-compatible.
 
 ---
 
 ## 3. Behavior & Compatibility
 
-### 3.1 Backward Compatibility
-
-- If `isolation` is omitted or `mode = "disabled"`:
-  - Chalybs does not evaluate or enforce isolation rules.
-  - Behavior matches previous releases.
-
-### 3.2 Enforced Safety (Opt-In)
-
-- If `mode = "audit"`:
-  - All isolation checks run.
-  - Findings appear in logs only.
-  - VFIO staging and VM startup continue.
-
-- If `mode = "enforce"`:
-  - Isolation is evaluated *before* VFIO plan/execute:
-    - IOMMU group exclusivity
-    - Multi-function ownership consistency
-    - Host-critical GPU sharing
-  - Any `Violation`:
-    - Aborts startup with a clear `ChalybsError::Vfio` message.
-    - No VFIO sysfs writes have occurred yet.
+- No breaking changes.
+- v0.4.1 preserves all v0.4.0 semantics unless `level` is explicitly used.
+- Enforcement performed early: no sysfs writes happen if Phase 9 fails.
 
 ---
 
-## 4. Operational Notes
+## 4. Looking Ahead
 
-- **Suggested rollout pattern:**
-  1. Start with `mode = "audit"` on a single VM.
-  2. Inspect logs for violations and adjust hardware layout / config as needed.
-  3. Once green, move that VM to `mode = "enforce"`.
-  4. Repeat per-VM.
-
-- **Logging:**
-  - Isolation findings are emitted with fields:
-    - `vm`, `code`, `bdf`, `iommu_group`, `msg`.
-
----
-
-## 5. Relationship to v0.3.x
-
-- v0.3.4 introduced Phase 7 (deterministic VFIO restore).
-- v0.3.5 exists as a repository release but was not fully documented here.
-- v0.4.0 consolidates:
-  - The full Phase 1–7 pipeline.
-  - Newly implemented Phase 8 isolation policy.
-  - Refreshed documentation and example configuration.
-
----
-
-## 6. Looking Ahead
-
-Planned areas for the next minor releases:
-
-- **Implementation of `IsolationLevel` and `default_level`**  
-  (currently reserved / no-op in v0.4.0)
-- Multi-GPU policy (iGPU/dGPU arbitration, per-GPU overrides).
-- More nuanced isolation levels (per-device, per-class).
-- NUMA/IRQ advisors and “what-if” analysis.
-- Expanded test coverage for isolation and VFIO stages (unit + integration).
+- Expansion of IsolationLevel semantics (NIC/storage classification).
+- Multi-GPU arbitration.
+- Advisor modes for NUMA, IRQ, and PCI placement.
+- More granular device-level safety options.

@@ -5,6 +5,48 @@
 
 ---
 
+## v0.4.1 — Isolation Phase-9 (Level Enforcement) & Structural Cleanup
+
+**Status:** Released  
+**Scope:** Activation of isolation-level semantics, cleanup of config drift, full VFIO/PCI synchronization.
+
+### Added
+
+- **Phase 9: Isolation Level Enforcement**
+  - `IsolationLevel` (`dedicated`, `shared_with_host`, `forbidden`) now active.
+  - VM-level `default_level` enforced.
+  - Per-device `PciDeviceConfig.level` supported and validated.
+  - Enforcement occurs before any VFIO sysfs writes.
+
+- **Config Shape Stabilization**
+  - `PciDeviceConfig` unified across modules.  
+    (Fixes the missing-`level` drift that caused E0063 test failures.)
+
+### Changed
+
+- **Isolation Pipeline**
+  - Phase 8 (mode-based policy) and Phase 9 (level-based enforcement) now run sequentially.
+  - VFIO planner & verifier updated to understand level semantics.
+
+- **Documentation**
+  - Architecture doc fully updated to v0.4.1.
+  - Release notes reflect Phase 9.
+  - Roadmap baseline changed to reference Phase 9 as implemented.
+
+### Fixed
+
+- E0560/E0063 struct drift errors in:
+  - `vfio/plan.rs`
+  - `vfio/verify.rs`
+  - `vfio/isolation.rs` test blocks
+
+### Compatibility Notes
+
+- Existing configurations remain valid.
+- Devices with no `level` inherit `default_level`.
+- Default behavior matches v0.4.0 unless levels are explicitly configured.
+
+
 ## v0.4.0 — PCI Phase 8 & Isolation Policy Integration
 
 **Status:** Released  

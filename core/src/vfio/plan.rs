@@ -225,7 +225,8 @@ fn stage_device_list(
 mod tests {
     use super::*;
     use crate::config::{
-        CpuConfig, DevicesConfig, GpuPolicyConfig, IsolationPolicyConfig, NumaConfig, QemuConfig,
+        CpuConfig, DevicesConfig, GpuPolicyConfig, IsolationPolicyConfig, NumaConfig,
+        PciDeviceConfig, QemuConfig,
     };
 
     fn minimal_vm_config_with_gpu(bdf: &str) -> VmConfig {
@@ -248,6 +249,7 @@ mod tests {
                 gpu: Some(vec![PciDeviceConfig {
                     pci_address: bdf.to_string(),
                     required: true,
+                    level: None,
                 }]),
                 nvme: None,
                 nic: None,

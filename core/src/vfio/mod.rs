@@ -16,6 +16,7 @@
 //!   - Phase 6: VFIO post-execution verification
 //!   - Phase 7: VFIO restoration (deterministic teardown)
 //!   - Phase 8: Device isolation policy gate (IOMMU-group focused)
+//!   - Phase 9: IsolationLevel enforcement (per-device policy)
 
 mod execute;
 mod isolation;
@@ -97,17 +98,28 @@ impl RestoreSummary {
 
 /// Stage all PCI devices required by this VM for passthrough:
 ///
-/// 1. Build a VFIO action plan from VM config + PCI inventory.
-/// 2. Run the Phase 8 isolation policy gate for this VM.
-/// 3. Execute the plan (unbind current drivers, bind to vfio-pci),
+/// 1. Build a fresh PCI inventory snapshot from sysfs.
+/// 2. Run the Phase 8/9 isolation policy gate for this VM (read-only).
+/// 3. Build a VFIO action plan from VM config + PCI inventory.
+/// 4. Execute the plan (unbind current drivers, bind to vfio-pci),
 ///    recording the original driver bindings in the VmRuntime.
-/// 4. Re-scan PCI inventory and verify that all configured passthrough
+/// 5. Re-scan PCI inventory and verify that all configured passthrough
 ///    devices are now bound to vfio-pci.
 ///
 /// This function is called from VmState::PreparePci.
 pub fn stage_pci_devices_for_vm(rt: &mut VmRuntime) -> Result<()> {
-    // Phase 5: plan.
+    // Fresh inventory snapshot.
     let inv = PciInventory::scan()?;
+
+    // Phase 8/9: device isolation policy gate.
+    //
+    // This is a pure, read-only check that consumes VmConfig and the
+    // current PCI inventory. Depending on the per-VM isolation mode,
+    // violations are either logged (Audit) or treated as hard errors
+    // (Enforce). In Disabled mode, this is a no-op.
+    isolation::evaluate_isolation_for_vm(&rt.name, &rt.cfg, &inv)?;
+
+    // Phase 5: build VFIO action plan.
     let plan = build_plan_for_vm(&rt.name, &rt.cfg, &inv)?;
 
     info!(
@@ -115,14 +127,6 @@ pub fn stage_pci_devices_for_vm(rt: &mut VmRuntime) -> Result<()> {
         actions = plan.actions.len(),
         "vfio: staging PCI devices for VM"
     );
-
-    // Phase 8: device isolation policy gate.
-    //
-    // This is a pure, read-only check that consumes VmConfig and the
-    // current PCI inventory. Depending on the per-VM isolation mode,
-    // violations are either logged (Audit) or treated as hard errors
-    // (Enforce). In Disabled mode, this is a no-op.
-    isolation::evaluate_isolation_for_vm(&rt.name, &rt.cfg, &inv)?;
 
     // Phase 5: execute the plan and record original driver bindings so
     // we can restore them during shutdown.

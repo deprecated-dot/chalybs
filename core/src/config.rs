@@ -30,10 +30,11 @@ pub struct VmConfig {
     #[serde(default)]
     pub gpu: GpuPolicyConfig,
 
-    /// Device isolation policy (Phase 8).
+    /// Device isolation policy (Phase 8 / Phase 9).
     ///
     /// This controls whether Chalybs enforces IOMMU-group based
-    /// isolation for all passthrough devices (GPU, NVMe, NIC, USB).
+    /// isolation for all passthrough devices (GPU, NVMe, NIC, USB),
+    /// and how per-device IsolationLevel values are interpreted.
     ///
     /// By default, isolation is **disabled** so existing configs
     /// continue to behave as before. Operators may opt into `Audit`
@@ -102,6 +103,15 @@ pub struct PciDeviceConfig {
     /// If true (default), VM startup fails if this device is missing
     #[serde(default = "default_required")]
     pub required: bool,
+
+    /// Optional per-device isolation level override.
+    ///
+    /// If omitted, the VM’s `isolation.default_level` applies. When
+    /// present, this value participates in the Phase 9 isolation-level
+    /// evaluation and can upgrade or relax the default policy for this
+    /// specific device.
+    #[serde(default)]
+    pub level: Option<IsolationLevel>,
 }
 
 fn default_required() -> bool {
@@ -129,12 +139,12 @@ pub struct GpuPolicyConfig {
     pub force_use_igpu: bool,
 }
 
-/// Isolation mode for device safety (Phase 8).
+/// Isolation mode for device safety (Phase 8 / Phase 9).
 ///
 /// - Disabled → no additional checks; behavior is identical to
 ///   earlier versions of Chalybs.
-/// - Audit    → evaluate isolation and log findings, but do not
-///   block startup.
+/// - Audit    → evaluate isolation and isolation levels, log findings,
+///   but do not block startup.
 /// - Enforce  → treat any isolation violation as a hard error and
 ///   abort VFIO staging before touching sysfs.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -147,10 +157,15 @@ pub enum IsolationMode {
 
 /// Desired isolation level for passthrough devices.
 ///
-/// At present this is used as an intent signal for diagnostics; it
-/// allows future per-device overrides. For now, the default level is
-/// Dedicated, which pairs naturally with strict IOMMU-group checks.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+/// In Phase 9 this becomes behavior-driving:
+///
+/// - Dedicated      → device expects exclusive IOMMU grouping with
+///   other Dedicated devices for this VM only.
+/// - SharedWithHost → device may share an IOMMU group with host-owned
+///   devices, subject to other policy checks.
+/// - Forbidden      → device must not be passed through; any attempt
+///   to do so is a policy violation.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum IsolationLevel {
     Dedicated,
@@ -158,12 +173,15 @@ pub enum IsolationLevel {
     Forbidden,
 }
 
-/// Per-VM device isolation policy (Phase 8).
+/// Per-VM device isolation policy (Phase 8 / Phase 9).
 ///
 /// This is intentionally conservative by default (Disabled mode) so
 /// existing VM configurations behave exactly as before. Operators can
 /// opt into Audit or Enforce for stricter guarantees around IOMMU
 /// isolation and host-critical device sharing.
+///
+/// Phase 9 uses `default_level` as the baseline for each device,
+/// allowing per-device overrides via `PciDeviceConfig.level`.
 #[derive(Debug, Deserialize, Clone, Copy)]
 pub struct IsolationPolicyConfig {
     /// Overall isolation mode for this VM.
@@ -173,10 +191,7 @@ pub struct IsolationPolicyConfig {
     pub mode: IsolationMode,
 
     /// Default isolation level for passthrough devices that do not
-    /// have an explicit override in future configuration surfaces.
-    ///
-    /// Currently this is used only as an intent hint and logged as
-    /// part of the isolation evaluation path.
+    /// have an explicit override in `PciDeviceConfig.level`.
     #[serde(default = "default_isolation_level")]
     pub default_level: IsolationLevel,
 

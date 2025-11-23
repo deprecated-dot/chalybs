@@ -165,6 +165,7 @@ mod tests {
                         .map(|bdf| PciDeviceConfig {
                             pci_address: (*bdf).to_string(),
                             required: true,
+                            level: None,
                         })
                         .collect(),
                 )

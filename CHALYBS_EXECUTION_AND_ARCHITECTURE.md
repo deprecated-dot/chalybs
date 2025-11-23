@@ -1,18 +1,15 @@
-# Chalybs Execution & Architecture (v0.4.0)
+# Chalybs Execution & Architecture (v0.4.1)
 
-> **Authoritative architecture reference for Chalybs v0.4.0**
+> **Authoritative architecture reference for Chalybs v0.4.1**
 >
 > This document describes:
 > - End-to-end VM execution pipeline
 > - Deterministic state machine
-> - PCI / GPU / VFIO architecture (Phases 1–8 complete)
+> - PCI / GPU / VFIO architecture (Phases 1–9 online)
 > - NUMA-aware CPU isolation (C2 policy)
 > - Device isolation policy (Phase 8)
-> - System layout and future direction  
->
-> **Note:** `IsolationLevel` and `default_level` appear in the configuration
-> schema as reserved fields but are **not implemented** in the v0.4.0 codebase.
-> They will be introduced early in the next development cycle.
+> - Device isolation *level* enforcement (Phase 9)
+> - System layout and forward roadmap  
 
 For change history, see `CHANGELOG.md`.  
 For release details, see `RELEASE_NOTES.md`.  
@@ -22,20 +19,21 @@ For future plans, see `ROADMAP.md`.
 
 ## 1. System Overview
 
-Chalybs is a deterministic virtualization orchestrator with:
+Chalybs is a deterministic virtualization orchestrator providing:
 
-- Rust-native, sysfs-driven PCI/VFIO control
-- Deterministic VM bring-up and teardown
-- NUMA-aware CPU / IRQ orchestration
-- Safety policy layers for GPU and PCI passthrough
+- Rust-native, sysfs-driven PCI/VFIO control  
+- Strict deterministic state machine for VM lifecycle
+- NUMA-aware vCPU/IRQ placement
+- Multi-layer passthrough safety policies
+- Device isolation mode + device isolation *level* enforcement
 
-It is composed of:
+Components:
 
-| Component      | Purpose                                                           |
-|----------------|-------------------------------------------------------------------|
-| `chalybs-core` | Library containing state machine, configs, PCI/VFIO logic         |
-| `chalybs`      | CLI wrapper around core                                           |
-| `chalybsd`     | (Future) daemon with control-plane API and long-lived VM lifecycles |
+| Component      | Purpose                                                                |
+|----------------|------------------------------------------------------------------------|
+| `chalybs-core` | Deterministic state machine, VFIO/PCI pipeline, isolation phases       |
+| `chalybs`      | CLI wrapper around the core                                             |
+| `chalybsd`     | (Future) daemon / long-lived supervisor                                 |
 
 ---
 
@@ -52,21 +50,17 @@ flowchart LR
         D --> E[run_until_steady()]
     end
 
-    subgraph CORE["chalybs-core"]
+    subgraph CORE
         E --> F[State machine\nPrepare → Steady]
         F --> G[VM steady-state]
         G --> H[run_shutdown()]
     end
 
     subgraph QEMU["QEMU process"]
-        F -.spawn.-> Q[QEMU process]
-        H -.teardown.-> QX[QEMU exit]
+        F -.spawn.-> Q[QEMU]
+        H -.teardown.-> QX[exit]
     end
 ```
-
-The central coordinator is the state machine in `core/src/state.rs`, which drives
-a VM from initial validation through steady-state and back down through shutdown
-and VFIO restore.
 
 ---
 
@@ -96,68 +90,64 @@ stateDiagram-v2
 
 ### 3.2 State Responsibilities
 
-- **Init**  
-  Pure entry state; no side effects.
-
-- **Validate**  
-  Validate configuration and host environment.
-
-- **PreparePci** (Phases 5–8)  
-  - Build host PCI inventory  
+- **Init**
+- **Validate**
+- **PreparePci**  
+  *Phases 5–9 combined:*  
+  - Inventory  
+  - GPU unbind feasibility  
   - Build VFIO plan  
-  - **Evaluate device isolation policy (Phase 8)**  
+  - **Evaluate isolation policy (Phase 8)**  
+  - **Evaluate isolation *levels* (Phase 9)**  
   - Execute VFIO plan  
-  - Verify final VFIO bindings  
-
-- **ReserveCpus**  
-  NUMA-aware CPU reservation and cpuset creation.
-
-- **LaunchQemu**  
-  Spawn QEMU with prepared topology and devices.
-
-- **DetectThreads / PinVcpus / DetectMsi / PinIrqs**  
-  Deterministic IRQ and vCPU placement.
-
-- **PeripheralHooks**  
-  Apply Tasmota, DDC, Looking Glass, etc.
-
-- **Steady**  
-  VM fully live.
-
-- **Shutdown / Cleanup**  
-  Deterministic VFIO restore → cpuset teardown → idle.
+  - Verify VFIO bindings  
+- **ReserveCpus / LaunchQemu / Pinning / Peripheral hooks**
+- **Shutdown / Cleanup**
 
 ---
 
 ## 4. CPU & NUMA Architecture (C2 Policy)
 
-*(identical to your current doc — unchanged for v0.4.0)*
+*(unchanged from 0.4.0, remains authoritative)*
 
 ---
 
 ## 5. PCI / GPU / VFIO Phases
 
-*(identical to your current doc — Phases 1–7 unchanged)*
+### 5.1 Phase Summary (v0.4.1)
+
+| Phase | Name                                  | Active | Notes |
+|-------|----------------------------------------|--------|-------|
+| 1     | Inventory                              | ✔      | PCI snapshot |
+| 2     | GPU driver classification               | ✔      | host vs vfio |
+| 3     | GPU unbind safety simulation           | ✔      | risk-based |
+| 4     | VFIO sysfs helpers                     | ✔      | pure helpers |
+| 5     | VFIO plan builder                      | ✔      | deterministic |
+| 6     | Execute VFIO plan                      | ✔      | sysfs writes |
+| 7     | VFIO binding verification              | ✔      | post-bind |
+| 8     | Isolation policy (mode + checks)       | ✔      | Audit/Enforce |
+| 9     | **Isolation level enforcement**        | ✔ (new in 0.4.1) | new semantic layer |
 
 ---
 
-## 6. Phase 8: Device Isolation Policy
+## 6. Phase 8: Device Isolation Policy (Mode-Based)
 
-Phase 8 introduces a per-VM device isolation policy.  
-Configuration fields:
+**Unmodified from v0.4.0 except documentation cleanup.**  
+Evaluates:
+
+- IOMMU exclusivity  
+- Multifunction consistency  
+- Host-critical GPU sharing  
+
+Mode controls behavior (`disabled`, `audit`, `enforce`).
+
+---
+
+## 7. Phase 9: Isolation Level Enforcement (New in v0.4.1)
+
+`IsolationLevel` is **no longer reserved**.
 
 ```rust
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum IsolationMode {
-    Disabled,
-    Audit,
-    Enforce,
-}
-
-// RESERVED — not implemented in v0.4.0.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum IsolationLevel {
     Dedicated,
     SharedWithHost,
@@ -165,76 +155,57 @@ pub enum IsolationLevel {
 }
 ```
 
-```rust
-#[derive(Debug, Deserialize, Clone, Copy)]
-pub struct IsolationPolicyConfig {
-    pub mode: IsolationMode,
-    pub default_level: IsolationLevel,  // reserved
-    pub require_iommu_exclusive: bool,
-    pub require_multifunction_consistency: bool,
-    pub forbid_host_critical_in_group: bool,
-}
-```
+### 7.1 VM-Level `default_level`
 
-### 6.1 Isolation Modes
+Used as the policy applied to any PCI device lacking an explicit per-device level.
 
-*(same as before)*
+### 7.2 Enforcement Behavior
 
-### 6.2 Checks Performed
+| Level            | Meaning                                                                             |
+|------------------|-------------------------------------------------------------------------------------|
+| `Dedicated`      | Device must not share IOMMU group with host-owned devices                          |
+| `SharedWithHost` | Sharing is allowed, but conflicts may still generate warnings                       |
+| `Forbidden`      | Device cannot be passed through at all                                              |
 
-- IOMMU group exclusivity  
-- Multifunction consistency  
-- Host-critical GPU sharing  
+### 7.3 Enforcement Timing
 
-**Note:** `default_level` does not affect any behavior in this release.
+Phase 9 runs **after** Phase 8 validation but **before** any VFIO sysfs writes.
 
-### 6.3 Findings Model
+### 7.4 Current Scope (v0.4.1)
 
-*(unchanged)*
-
-### 6.4 Evaluation Flow
-
-*(unchanged)*
+- Level affects policy decisions and device validation.
+- No breaking behavior is introduced relative to v0.4.0.
+- Per-device overrides enabled via `PciDeviceConfig.level`.
 
 ---
 
-## 7. Configuration Surfaces
+## 8. Configuration Surfaces
 
-*(unchanged aside from note that default_level is reserved)*
+Updated to reflect:
+
+- Active `IsolationLevel`
+- Active `default_level`
+- Per-device level overrides
 
 ---
 
-## 8. Peripheral Execution Model
-
+## 9. Peripheral Execution Model  
 *(unchanged)*
 
 ---
 
-## 9. Bring-Up & Shutdown Sequences
-
+## 10. Bring-Up & Shutdown Sequences  
 *(unchanged)*
-
----
-
-## 10. Future Direction (v0.4.x → v1.0)
-
-- Implementation of `IsolationLevel` and `default_level` semantics  
-- Multi-GPU arbitration  
-- More isolation rules  
-- NUMA/IRQ advisor  
-- Daemon / control plane  
-- Hardened deterministic mode  
 
 ---
 
 ## 11. Summary
 
-Chalybs v0.4.0 delivers:
+Chalybs v0.4.1 delivers:
 
-- A complete 8-phase PCI/VFIO pipeline  
-- Deterministic VM state machine  
-- Anonymous, safe isolation policy (Phase 8)  
-- Reserved fields for future isolation-level semantics  
-- NUMA-aware vCPU and IRQ placement  
+- **Phase 9 isolation level enforcement now active**
+- Full synchronization of config struct → planner → verifier → isolation engines
+- All tests passing; deterministic behavior preserved
+- Clippy-clean codebase
 
-This document is the canonical reference for v0.4.0.
+This document is now the canonical reference for **v0.4.1**.
