@@ -5,6 +5,17 @@
 
 ---
 
+## 1.1 TUI Baseline (v0.5.0)
+
+- Fully operational text UI with modal overlays
+- Event stream with scrollback + locking
+- Shell panel with history
+- Brand-consistent theming engine
+- Stable UI architecture (ui.rs, app.rs, theme.rs, logo.rs)
+- Mock backend integration online
+
+This forms the foundation for all future `chalybsd` interaction.
+
 ## 1. Current Baseline (v0.4.1)
 
 - PCI/VFIO Phases 1–9 complete.
@@ -33,6 +44,19 @@
 - Dry-run mode for VFIO.
 - Better synthetic inventories and debugging commands.
 - Improved error surfacing for exotic IOMMU group layouts.
+
+### 2.4 TUI Expansion (v0.5.x – v0.6.x)
+
+- Live VM control actions from TUI:
+  - Power on/off
+  - Restart
+  - Rebind devices
+  - Inspect VFIO plan / inventory
+- “Event detail” modal (stacked modals)
+- Sidebar expander for CPU/IRQ heatmaps
+- Better terminal-agnostic layout (80x24 compatibility mode)
+- Optional kitty-graphics renderer for logo and PCI diagrams
+- Theme customizer + accessibility mode (high contrast)
 
 ---
 

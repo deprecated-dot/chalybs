@@ -5,6 +5,89 @@
 
 ---
 
+## v0.5.0 — First Functional TUI (Chalybs Terminal UI)
+
+**Status:** Released  
+**Scope:** Introduction of the complete TUI subsystem, including panels,
+interaction model, modal system, brand-aligned color theme, and foundation for
+daemon-driven live VM management.
+
+### Added
+
+- **Chalybs TUI (new subsystem)**
+  - Three-panel layout:
+    - VM Status panel (left)
+    - Events stream with scroll lock (middle)
+    - Chalybs shell with input + history (right)
+  - Brand-derived theme system:
+    - ACCENT_TEAL, ACCENT_PINK, ACCENT_PURPLE
+    - SUCCESS/WARNING/ERROR semantic surfaces
+    - Normal/Dim text layers
+  - Initial **Chalybs logo** (ASCII rune + header)
+
+- **Event Stream with Scroll Control**
+  - PgUp/PgDn scrollback
+  - `Ctrl-S` lock view (prevent auto-follow)
+  - `Ctrl-Q` unlock and snap to latest
+  - `LOCKED` state indicator
+
+- **Shell Subsystem**
+  - Input prompt with styled prefix
+  - Command history
+  - Integration with mock backend
+
+- **VM Status Panel**
+  - Color-coded state glyphs:
+    - Running → teal
+    - Starting/ShuttingDown → amber
+    - Stopped → red
+  - Highlighted selected VM
+  - Upcoming: richer indicators (CPU pinning, IRQs, etc.)
+
+- **Modal Overlay System ("Scrim D")**
+  - F2 opens VM detail modal
+  - Esc closes
+  - Fully opaque modal with shaded border + filled background
+  - Scrim layer prevents bleed-through on transparent terminals
+  - Modal presents:
+    - State
+    - CPU pinned
+    - IRQ pinned
+    - Tasmota status
+    - Isolation mode
+    - Hugepages
+
+- **Theme Extensions**
+  - `modal_bg()` and `scrim_bg()` surfaces
+  - Unified style entrypoints for blocks, headers, glyphs, events, and modal text
+
+### Changed
+
+- UI architecture restructured into:
+  - `ui.rs` (layout & rendering)
+  - `logo.rs` (logo rendering backends)
+  - `theme.rs` (palette + style)
+  - `app.rs` (pure state/logic, backend-agnostic)
+
+- Moved modal toggling to **F2**  
+  (`d` deprecated for future shell command surface)
+
+- Overhauled event scrolling logic:
+  - Window follows latest unless locked
+  - Offset-safe bounds checking
+
+### Fixed
+
+- Bleed-through between events panel and modal overlay (transparent terminals)
+- Drift between modal keybind docs and implementation
+- Type inference issues in VM list rendering (`collect::<Vec<_>>()`)
+
+### Compatibility Notes
+
+- No CLI or config surfaces changed.
+- TUI currently talks only to MockBackend; daemon integration will begin in v0.5.x.
+
+
 ## v0.4.1 — Isolation Phase-9 (Level Enforcement) & Structural Cleanup
 
 **Status:** Released  

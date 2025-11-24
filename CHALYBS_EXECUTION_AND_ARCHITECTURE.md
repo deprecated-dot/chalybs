@@ -209,3 +209,42 @@ Chalybs v0.4.1 delivers:
 - Clippy-clean codebase
 
 This document is now the canonical reference for **v0.4.1**.
+
+---
+
+## 12. TUI Subsystem Architecture (v0.5.0)
+
+The TUI is a standalone frontend designed to remain backend-agnostic. It interacts
+with the system exclusively through the `ChalybsBackend` trait.
+
+### 12.1 Modules
+
+| File              | Responsibility                                          |
+|-------------------|----------------------------------------------------------|
+| `app.rs`          | Pure state, event buffers, VM list, scroll logic         |
+| `ui.rs`           | Layout + rendering of all panels + modal system          |
+| `theme.rs`        | Palette, semantic styles, modal/scrim layers             |
+| `logo.rs`         | ASCII logo + future kitty-graphics renderer abstraction  |
+
+### 12.2 Render Tree
+
+```mermaid
+flowchart TD
+    Main["main.rs"] --> Draw["draw()"]
+    Draw --> Header["draw_header"]
+    Draw --> Body["draw_body"]
+    Draw --> Footer["draw_footer"]
+    Draw --> Modal{"draw_vm_detail_modal?"}
+
+    Body --> Status["draw_status_panel"]
+    Body --> Events["draw_events_panel"]
+    Body --> Shell["draw_shell_panel"]
+```
+
+12.4 Backend Boundary (Stable)
+```pub trait ChalybsBackend {
+    fn initial_vms(&self) -> Vec<VmStatus>;
+    fn refresh_status(&mut self, vms: &mut [VmStatus]);
+    fn poll_events(&mut self) -> Vec<AppEvent>;
+    fn handle_shell_command(&mut self, command: &str) -> Vec<AppEvent>;
+}```
