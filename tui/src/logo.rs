@@ -6,20 +6,52 @@ use ratatui::{
     Frame,
 };
 
+use crate::app::VisualEffects;
 use crate::theme;
+
+/// Internal helper: compute a gently "breathing" style for the rune glyph,
+/// driven by `tick` and `effects.logo_reactive`.
+fn logo_rune_style(tick: u64, effects: &VisualEffects) -> ratatui::style::Style {
+    let base = theme::header_title().fg(crate::theme::palette::ACCENT_PINK);
+
+    if !effects.logo_reactive {
+        return base;
+    }
+
+    // Very gentle, slow pulse — no RGB unicorn puke.
+    let phase = (tick / 8) % 16;
+
+    match phase {
+        // Slightly dimmed part of the cycle.
+        0 | 1 => base.add_modifier(Modifier::DIM),
+
+        // Neutral most of the time.
+        2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 => base,
+
+        // Brief brighter "focus" moments.
+        10 | 11 | 12 => base.add_modifier(Modifier::BOLD),
+
+        // Rare alternate hue to hint at a "charge" build-up.
+        _ => base
+            .fg(crate::theme::palette::ACCENT_PURPLE)
+            .add_modifier(Modifier::BOLD),
+    }
+}
 
 /// Render the current Chalybs logo representation.
 ///
 /// This is intentionally kept simple: stylized text + rune that
 /// mirrors the shield/slash logo without trying to reproduce the
 /// full image in ASCII.
-pub fn draw_logo(f: &mut Frame, area: Rect) {
+///
+/// `tick` and `effects` are used for a subtle reactive "breathing"
+/// effect on the rune glyph.
+pub fn draw_logo(f: &mut Frame, area: Rect, tick: u64, effects: &VisualEffects) {
+    let rune_style = logo_rune_style(tick, effects);
+
     let title = Line::from(vec![
         Span::styled("CHALYBS ", theme::header_title()),
-        Span::styled(
-            "⟐",
-            theme::header_title().fg(crate::theme::palette::ACCENT_PINK),
-        ),
+        Span::styled("⟐", rune_style),
     ]);
 
     // A simple "runic slash C" mark under the title.
@@ -70,7 +102,10 @@ pub struct AsciiLogoRenderer;
 
 impl LogoRenderer for AsciiLogoRenderer {
     fn render(&self, f: &mut Frame, area: Rect) {
-        draw_logo(f, area);
+        // For generic renderers we don't have `tick` or `effects`,
+        // so we call into the animated logo with a neutral baseline.
+        let effects = VisualEffects::default_enabled();
+        draw_logo(f, area, 0, &effects);
     }
 }
 

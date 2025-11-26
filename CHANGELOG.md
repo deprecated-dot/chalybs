@@ -5,6 +5,41 @@
 
 ---
 
+## v1.0.0 – TUI visual effects baseline
+
+**Status:** local-only / not yet packaged
+
+### Added
+- First-class TUI visual effects engine with deterministic, aesthetic-only behavior.
+- `VisualEffects` configuration struct with on-disk persistence via `tui.conf`.
+- `effects` local shell command:
+  - `effects status` to print current flag values.
+  - `effects on` / `effects off` to toggle all effects at once.
+  - `effects <pulse|scanlines|matrix|border|badges|logo|load> <on|off>` to control individual flags.
+  - `effects save` to persist the current configuration.
+- VM list layout refinements:
+  - Width-aware layouts (full / medium / compact) with micro-badges for ISO/TAS/CPU/IRQ.
+  - Per-VM synthetic load sparkline under the VM row when `load_index` is enabled.
+  - Pulsing state glyphs for non-stopped VMs when `pulse` is enabled.
+- Events panel enhancements:
+  - Subtle scanline-style row banding driven by `tick_count`.
+  - Matrix-style watermark prefix (drifting dots + occasional glitch glyphs) that never obscures real log text.
+- Panel border EMI shimmer:
+  - Per-panel salted pseudo-random shimmer with very low amplitude "hiss".
+  - Rare, short-lived brightness bursts and dual-frequency wobble for a lab-bench RF noise feel.
+- Header visual load indicator: optional single-row sparkline when `load_index` is enabled.
+
+### Changed
+- TUI shell command handling now supports local-only commands (`effects ...`) without forwarding them to the backend.
+- Shell command submission path cleaned up to avoid borrow-checker hazards while keeping history and events in sync.
+- Minor tweaks to `theme.rs` and `logo.rs` to keep all visual effects strictly cosmetic and opt-out via config.
+
+### Notes
+- Core daemon (chalybsd) execution model, PCI pipeline, and VM orchestration remain unchanged from v0.5.0.
+- All visual effects are driven from deterministic inputs (tick counters, salts, and config) and do **not** affect control-plane behavior.
+- This release is considered the first "1.x" visual baseline for the TUI; future changes should treat these behaviors as stable UX.
+
+
 ## v0.5.0 — First Functional TUI (Chalybs Terminal UI)
 
 **Status:** Released  

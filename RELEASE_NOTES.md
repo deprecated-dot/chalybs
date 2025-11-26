@@ -5,6 +5,57 @@
 
 ---
 
+## v1.0.0 – Visual Effects Baseline for chalybs-tui
+
+### Highlights
+
+- Introduces a dedicated **visual effects engine** for `chalybs-tui`:
+  - Pulse/heartbeat glyphs for VM state.
+  - Scanline-style row banding in the events panel.
+  - Matrix-style drifting dot watermark with occasional glitch glyphs.
+  - Subtle EMI-style border shimmer on panels (per-panel salted, deterministic).
+  - Synthetic single-row load sparklines in the header and per-VM rows.
+- Adds a persistent **visual effects configuration** layer:
+  - `VisualEffects` struct in `tui/src/app.rs`.
+  - Config file at `$XDG_CONFIG_HOME/chalybs/tui.conf` or `~/.config/chalybs/tui.conf`.
+  - Simple `key = true/false` format, easily hand-edited.
+- Extends the TUI shell with local-only **effects control**:
+  - `effects status`, `effects on`, `effects off`.
+  - `effects <pulse|scanlines|matrix|border|badges|logo|load> <on|off>`.
+  - `effects save` to persist current settings.
+
+### Upgrading from v0.5.0
+
+- No changes are required for the daemon, PCI pipeline, or VM definitions.
+- Existing users can simply rebuild `chalybs-tui` and run it; a default
+  `VisualEffects` configuration (all flags = `true`) is assumed when no
+  `tui.conf` exists.
+- To opt out of the new visuals:
+  - Run `effects off` from the TUI shell for a one-off session.
+  - Or create `tui.conf` with explicit flags, e.g.:
+
+    ```text
+    pulse = false
+    scanlines = false
+    matrix = false
+    border_noise = false
+    badges = true
+    logo_reactive = false
+    load_index = true
+    ```
+
+### Known Limitations / Future Work
+
+- Load sparklines currently use a deterministic synthetic pattern based on
+  `tick_count` and VM index. A future release will feed these from real
+  daemon-side metrics.
+- `logo_reactive` is wired through configuration but behaviorally minimal in
+  v1.0.0; full logo-state coupling is left for a later release.
+- All effects intentionally stay within the existing color palette; no
+  per-theme configuration of the effects engine is exposed yet.
+
+---
+
 ## 1. Highlights
 
 ### 1.1 First Fully Functional TUI

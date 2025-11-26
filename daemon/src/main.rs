@@ -1,18 +1,25 @@
 use anyhow::Result;
-use clap::Parser;
 use chalybs_core::logging::{init_logging, LogFormat};
+use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "chalybsd", about = "Chalybs launch daemon (stub)")]
+#[command(
+    name = "chalybsd",
+    about = "Chalybs launch daemon (multi-client IPC server)"
+)]
 struct DaemonCli {
     /// Log format: pretty | json
-    #[arg(short, long, default_value = "pretty")]
+    #[arg(short = 'f', long = "log-format", default_value = "pretty")]
     log_format: String,
 
     /// Log level: trace | debug | info | warn | error
-    #[arg(short, long, default_value = "info")]
+    #[arg(short = 'l', long = "log-level", default_value = "info")]
     log_level: String,
 }
+
+mod ipc;
+mod server;
+mod state;
 
 fn main() -> Result<()> {
     let cli = DaemonCli::parse();
@@ -24,8 +31,8 @@ fn main() -> Result<()> {
 
     init_logging(format, &cli.log_level);
 
-    tracing::info!("chalybsd daemon stub starting (no IPC implemented yet)");
+    tracing::info!("chalybsd daemon starting (IPC server)");
 
-    // Placeholder: later add Unix socket, event loop, etc.
-    Ok(())
+    // Full deterministic multi-client server
+    server::run_server()
 }

@@ -1,6 +1,6 @@
-# Chalybs Execution & Architecture (v0.4.1)
+# Chalybs Execution & Architecture (v1.0.0)
 
-> **Authoritative architecture reference for Chalybs v0.4.1**
+> **Authoritative architecture reference for Chalybs v1.0.0**
 >
 > This document describes:
 > - End-to-end VM execution pipeline
@@ -248,3 +248,128 @@ flowchart TD
     fn poll_events(&mut self) -> Vec<AppEvent>;
     fn handle_shell_command(&mut self, command: &str) -> Vec<AppEvent>;
 }```
+
+
+---
+
+## 12.5 TUI Visual Effects Engine (v1.0.0)
+
+The `chalybs-tui` frontend now has a first-class **visual effects engine** that is
+deliberately **aesthetic-only**: it never affects the VM control plane, daemon
+state machine, or PCI pipeline. Everything is derived from deterministic inputs
+(`tick_count`, per-panel salt values, and static configuration) so the TUI remains
+repeatable and debuggable.
+
+### 12.5.1 Effect Flags and Persistence
+
+Effects are controlled by the `VisualEffects` struct in `tui/src/app.rs`:
+
+- `pulse` – enables breathing / heartbeat-style glyph animations for VM state
+  indicators.
+- `scanlines` – applies subtle scanline-style banding in the events pane to keep
+  dense logs visually readable without feeling flat.
+- `matrix` – draws a low-key "watermark" of drifting dots and occasional glyphs
+  in the events list, evoking a background data waterfall without overwhelming
+  real log lines.
+- `border_noise` – adds very subtle EMI-style shimmer to panel borders using
+  per-panel salts, long-tail rare bursts, and dual-frequency micro-variation.
+- `badges` – controls whether extended VM micro-badges (ISO / TAS / CPU / IRQ)
+  are rendered when layout width allows.
+- `logo_reactive` – reserved flag for logo reactivity; currently wired into the
+  configuration but intentionally left behaviorally minimal in v1.0.0.
+- `load_index` – enables single-row "sparkline" load gauges in the header and
+  per-VM rows (synthetic for now, daemon-backed in a future release).
+
+Configuration is loaded and saved via:
+
+- `VisualEffects::load_from_disk()`
+- `VisualEffects::save_to_disk()`
+
+using `XDG_CONFIG_HOME/chalybs/tui.conf` or `~/.config/chalybs/tui.conf`. The file
+is a simple `key = value` boolean map, and users can also toggle flags at runtime
+through the **local TUI shell**:
+
+```text
+effects status
+effects on
+effects off
+effects scanlines on
+effects border off
+effects save
+```
+
+### 12.5.2 VM List Layout and Load Sparkline
+
+The VM status panel (`tui/src/ui.rs`) now has width-aware layouts:
+
+- **Wide (`>= VM_LAYOUT_WIDTH_FULL`)**
+  - Row 1: selection marker, state glyph, VM name, `[STATE]` badge, and compact
+    micro-badges: `[ISO: XXX]`, `[TAS: ON/OFF]`, `[CPU]`, `[IRQ]`.
+  - Row 2: an indented `load ▁▂▃▄▅▆▇█` sparkline driven by `tick_count` +
+    `vm_index` when `effects.load_index` is enabled.
+- **Medium (`>= VM_LAYOUT_WIDTH_MEDIUM`)**
+  - Row 1: marker, glyph, name, `[STATE]`.
+  - Row 2: indented `[ISO: XXX]` + `[TAS: ...]` when `effects.badges` is on.
+- **Narrow**
+  - Single line with just marker, glyph, name, and state badge.
+
+The glyph next to each VM name is a small pulsating dot when `effects.pulse` is
+enabled and the VM is not `Stopped`. The pulse is a low-amplitude, low-frequency
+cycle (`• → ● → ◉ → ●`) that reads more like a heartbeat than a busy spinner.
+
+The header line also gains an optional synthetic load sparkline when
+`effects.load_index` is true:
+
+```text
+Chalybs – Forged in Linux ...   [load ▁▂▃▄▅▆▇█]
+```
+
+### 12.5.3 Events Panel: Scanlines + Matrix Watermark
+
+The events panel combines two layered effects:
+
+1. **Scanlines (`effects.scanlines`)**
+
+   - Every row’s base style is modulated by a drifting band index derived from
+     `row_index + tick_count / 8`.
+   - Bands alternate between `palette::BG`, `palette::PANEL_BG`, and a dimmed
+     variant of the base color, creating a very shallow CRT-like banding that
+     slowly slides over time.
+   - One band is left unmodified so the overall look remains calm, not noisy.
+
+2. **Matrix Watermark (`effects.matrix`)**
+
+   - Each event row receives a tiny prefix:
+     - Primarily `·` / `˙` dots that drift over time and by row index.
+     - Occasionally replaced with a more chaotic, but still rare, glyph from a
+       small ANSI-ish set to give a "Gibson" feel without devolving into
+       neon-vomit.
+   - The prefix is intentionally short (1–2 characters) so real log text stays
+     aligned and legible.
+
+All glyph choices and timing are deterministic functions of `tick_count` and
+`row_index`, keeping the effect reproducible while still feeling organic.
+
+### 12.5.4 Panel Border EMI Shimmer
+
+Panel borders (VMs, Events, Shell, and the VM detail modal) use
+`panel_border_style(tick, salt, &effects)` to compute a subtle EMI-like shimmer:
+
+- A per-panel `salt` ensures panels never blink in lockstep.
+- A deterministic pseudo-random `seed` is derived from `tick` + `salt`; there is
+  **no** global RNG.
+- Always-on **hiss**:
+  - Small, single-step variations between `dim_text`, `dim+DIM`, and
+    `normal+DIM` so borders never look perfectly static on modern high-DPI
+    terminals.
+- **Rare bursts**:
+  - With low probability and random durations (20–120 frames), a panel briefly
+    brightens to `normal` or `normal+BOLD` before decaying back to the hiss
+    baseline.
+- **Two-frequency superposition**:
+  - A slow LF wobble (`tick / 9`) and faster HF component (`tick / 2`) are
+    combined to decide how strong the current frame’s shimmer should be.
+
+The result is a low-level sense of life in the panels—closer to RF noise on a
+lab bench than a blinking "NO VACANCY" sign.
+

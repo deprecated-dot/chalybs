@@ -4,6 +4,30 @@ use serde::Serialize;
 
 use crate::config::VmConfig;
 
+/// Core-level event kind for VM-specific lifecycle activity.
+///
+/// This is intentionally small and decoupled from any particular logging
+/// backend. It can be projected into daemon/TUI IPC events or used for
+/// internal diagnostics.
+#[derive(Debug, Clone, Serialize)]
+pub enum CoreEventKind {
+    Info,
+    Warning,
+    Error,
+    System,
+}
+
+/// A single VM-scoped event emitted during the VM lifecycle.
+///
+/// These events are attached to `VmRuntime` and are intended to reflect
+/// major lifecycle milestones (PCI/VFIO transitions, cpuset changes,
+/// QEMU launch, pinning, isolation findings, shutdown, etc.).
+#[derive(Debug, Clone, Serialize)]
+pub struct CoreEvent {
+    pub kind: CoreEventKind,
+    pub message: String,
+}
+
 /// Simple representation of a CPU list: Vec<u32>
 #[derive(Debug, Clone, Serialize)]
 pub struct CpuSet {
@@ -63,6 +87,14 @@ pub struct VmRuntime {
     /// VFIO driver transitions performed while staging PCI devices for
     /// this VM. Used during shutdown to restore original bindings.
     pub vfio_transitions: Vec<VfioTransition>,
+
+    /// VM-scoped lifecycle events accumulated during execution.
+    ///
+    /// This is the per-VM half of the hybrid event model; the daemon
+    /// maintains its own global event bus for system-level activity.
+    /// These events are intended to be deterministic and ordered with
+    /// respect to the VM state machine.
+    pub events: Vec<CoreEvent>,
 }
 
 impl VmRuntime {
@@ -76,6 +108,7 @@ impl VmRuntime {
             pinned_threads: false,
             pinned_irqs: false,
             vfio_transitions: Vec::new(),
+            events: Vec::new(),
         }
     }
 
@@ -87,5 +120,39 @@ impl VmRuntime {
             vm: root.join("vfio_vm"),
             host: root.join("vfio_host"),
         });
+    }
+
+    /// Append a VM-scoped event with explicit kind and message.
+    ///
+    /// This is intentionally minimal; richer helpers (for specific phases
+    /// or subsystems) can be layered on top without changing the shape of
+    /// `CoreEvent` or `VmRuntime`.
+    pub fn push_event(&mut self, kind: CoreEventKind, message: impl Into<String>) {
+        self.events.push(CoreEvent {
+            kind,
+            message: message.into(),
+        });
+    }
+
+    /// Convenience helper for informational events.
+    pub fn push_info(&mut self, message: impl Into<String>) {
+        self.push_event(CoreEventKind::Info, message);
+    }
+
+    /// Convenience helper for warning events.
+    pub fn push_warning(&mut self, message: impl Into<String>) {
+        self.push_event(CoreEventKind::Warning, message);
+    }
+
+    /// Convenience helper for error events (semantic, not necessarily
+    /// fatal errors in the state machine).
+    pub fn push_error(&mut self, message: impl Into<String>) {
+        self.push_event(CoreEventKind::Error, message);
+    }
+
+    /// Convenience helper for system/structural VM events (e.g. VM
+    /// created, entering steady state, starting shutdown).
+    pub fn push_system(&mut self, message: impl Into<String>) {
+        self.push_event(CoreEventKind::System, message);
     }
 }

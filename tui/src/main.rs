@@ -15,7 +15,7 @@ mod logo;
 mod theme;
 mod ui;
 
-use crate::app::create_mock_app;
+use crate::app::create_app_autodetect;
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Run the TUI and ensure the terminal is always restored.
@@ -38,7 +38,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let (mut app, mut backend) = create_mock_app();
+    // Automatically select backend: daemon if available, otherwise mock.
+    let (mut app, mut backend) = create_app_autodetect();
 
     let tick_rate = Duration::from_millis(250);
     let mut last_tick = Instant::now();

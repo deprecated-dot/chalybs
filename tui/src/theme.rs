@@ -27,6 +27,9 @@ pub mod palette {
 }
 
 /// Convenience helpers for common styles.
+///
+/// These are deliberately small, composable building blocks rather than
+/// one-off "theme explosion".
 pub fn block_title() -> Style {
     Style::default()
         .fg(palette::ACCENT_TEAL)
@@ -88,6 +91,7 @@ pub fn glyph_err() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Event styles for the middle column.
 pub fn event_info() -> Style {
     Style::default().fg(palette::TEXT_NORMAL)
 }
