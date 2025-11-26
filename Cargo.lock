@@ -200,8 +200,11 @@ name = "chalybs-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chalybsd",
  "crossterm",
  "ratatui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -211,6 +214,8 @@ dependencies = [
  "anyhow",
  "chalybs-core",
  "clap",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
