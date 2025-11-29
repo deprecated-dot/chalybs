@@ -1,12 +1,12 @@
-use std::env;
-use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use chalybsd::ipc::{IpcEvent, IpcEventKind, IpcMessage, IpcVmEvents, IpcVmState, IpcVmStatus};
+use chalybsd::ipc::{IpcEvent, IpcEventKind, IpcMessage, IpcVmState, IpcVmStatus};
 use serde_json;
+
+use crate::config::{LogoHaloProfile, TuiConfig};
 
 /// Overall health state of the daemon from the TUI's perspective.
 ///
@@ -49,8 +49,10 @@ pub struct App {
     /// When true, show a VM detail modal overlay.
     pub vm_detail_open: bool,
 
-    /// Visual effect toggles for the TUI, loaded from disk (if present)
-    /// and modifiable at runtime via `effects` shell commands.
+    /// Visual effect toggles for the TUI. These default to ON and can be
+    /// adjusted at runtime via `effects` shell commands. Persistence is
+    /// handled externally (e.g. via global config / env); this type is
+    /// purely an in-memory description.
     pub effects: VisualEffects,
 
     /// Current notion of daemon health for UI purposes.
@@ -85,8 +87,12 @@ pub enum VmState {
 /// Visual effect configuration for the TUI.
 ///
 /// All effects default to ON. Users can toggle them at runtime
-/// via the `effects` shell command and optionally persist to
-/// a small config file under XDG config or ~/.config.
+/// via the `effects` shell command. Persistence (if any) is
+/// handled *outside* this type; we no longer touch XDG / $HOME
+/// or write any TUI-local config files.
+///
+/// The halo profile here is the **canonical Set C** enum shared
+/// with `tui::config` and `tui::logo_png`.
 #[derive(Clone, Debug)]
 pub struct VisualEffects {
     pub pulse: bool,
@@ -96,10 +102,15 @@ pub struct VisualEffects {
     pub badges: bool,
     pub logo_reactive: bool,
     pub load_index: bool,
+
+    /// Chalybs logo halo profile used by the PNG renderer.
+    pub logo_halo: LogoHaloProfile,
 }
 
 impl VisualEffects {
-    /// Default effect set: everything enabled.
+    /// Default effect set: everything enabled + halo profile = C3.
+    ///
+    /// This is the TUI's built-in default when no config/env is present.
     pub fn default_enabled() -> Self {
         Self {
             pulse: true,
@@ -109,97 +120,11 @@ impl VisualEffects {
             badges: true,
             logo_reactive: true,
             load_index: true,
+            logo_halo: LogoHaloProfile::Off,
         }
     }
 
-    /// Load effect configuration from disk, falling back to the
-    /// default-enabled configuration when no file exists or parsing
-    /// fails.
-    pub fn load_from_disk() -> Self {
-        let mut effects = Self::default_enabled();
-
-        let Some(path) = Self::config_path() else {
-            return effects;
-        };
-
-        let Ok(contents) = fs::read_to_string(&path) else {
-            // No config yet or unreadable; stick with defaults.
-            return effects;
-        };
-
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            let mut parts = line.splitn(2, '=');
-            let key = parts.next().map(str::trim);
-            let val = parts.next().map(str::trim);
-
-            let (Some(key), Some(val)) = (key, val) else {
-                continue;
-            };
-
-            let value = match val {
-                "true" | "on" | "1" => Some(true),
-                "false" | "off" | "0" => Some(false),
-                _ => None,
-            };
-
-            if let Some(v) = value {
-                effects.set_flag(key, v);
-            }
-        }
-
-        effects
-    }
-
-    /// Save the current effects configuration to disk.
-    ///
-    /// Uses XDG_CONFIG_HOME/chalybs/tui.conf or
-    /// ~/.config/chalybs/tui.conf as a fallback.
-    pub fn save_to_disk(&self) -> Result<(), String> {
-        let Some(path) = Self::config_path() else {
-            return Err("unable to determine config path for tui.conf".to_string());
-        };
-
-        if let Some(dir) = path.parent() {
-            if let Err(e) = fs::create_dir_all(dir) {
-                return Err(format!(
-                    "failed to create config directory {}: {e}",
-                    dir.display()
-                ));
-            }
-        }
-
-        let contents = format!(
-            "\
-# Chalybs TUI visual effects configuration
-# All values are boolean: true/false
-
-pulse = {pulse}
-scanlines = {scan}
-matrix = {matrix}
-border_noise = {border}
-badges = {badges}
-logo_reactive = {logo}
-load_index = {load}
-",
-            pulse = self.pulse,
-            scan = self.scanlines,
-            matrix = self.matrix,
-            border = self.border_noise,
-            badges = self.badges,
-            logo = self.logo_reactive,
-            load = self.load_index,
-        );
-
-        fs::write(&path, contents)
-            .map_err(|e| format!("failed to write TUI config to {}: {e}", path.display()))
-    }
-
-    /// Enable / disable all flags at once.
+    /// Enable / disable all flags at once (halo profile is left unchanged).
     pub fn set_all(&mut self, value: bool) {
         self.pulse = value;
         self.scanlines = value;
@@ -210,11 +135,14 @@ load_index = {load}
         self.load_index = value;
     }
 
-    /// Set an individual flag by textual name.
+    /// Set an individual flag by textual name (boolean toggles only).
     ///
     /// Accepted names:
     ///   pulse, scanlines, matrix, border, border_noise,
     ///   badges, logo, logo_reactive, load, load_index
+    ///
+    /// Halo profile is handled separately via:
+    ///   `effects halo <...>`
     pub fn set_flag(&mut self, name: &str, value: bool) {
         match name {
             "pulse" => self.pulse = value,
@@ -226,27 +154,6 @@ load_index = {load}
             "load" | "load_index" => self.load_index = value,
             _ => {}
         }
-    }
-
-    pub fn config_path() -> Option<PathBuf> {
-        if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg).join("chalybs").join("tui.conf"));
-            }
-        }
-
-        if let Ok(home) = env::var("HOME") {
-            if !home.is_empty() {
-                return Some(
-                    PathBuf::from(home)
-                        .join(".config")
-                        .join("chalybs")
-                        .join("tui.conf"),
-                );
-            }
-        }
-
-        None
     }
 }
 
@@ -762,7 +669,9 @@ impl App {
             events_scroll_locked: false,
             events_scroll_offset: 0,
             vm_detail_open: false,
-            effects: VisualEffects::load_from_disk(),
+            // Start with in-memory defaults; config/env can adjust
+            // halo and other effects at runtime via `effects` command.
+            effects: VisualEffects::default_enabled(),
             daemon_health: DaemonHealth::Disconnected,
             daemon_health_clean_runs: 0,
         }
@@ -901,7 +810,7 @@ impl App {
 
     /// TUI-local command handling.
     ///
-    /// Right now this only covers `effects` and related subcommands.
+    /// Right now this covers `effects` and related subcommands.
     ///
     /// Returns Some(events) if the command was recognized and handled
     /// locally, or None if it should be forwarded to the backend.
@@ -919,17 +828,19 @@ impl App {
 
         match sub.unwrap_or("status") {
             "status" => {
+                let halo = self.effects.logo_halo.as_str();
                 events.push(AppEvent {
                     kind: AppEventKind::Info,
                     message: format!(
-                        "effects: pulse={}, scanlines={}, matrix={}, border_noise={}, badges={}, logo_reactive={}, load_index={}",
+                        "effects: pulse={}, scanlines={}, matrix={}, border_noise={}, badges={}, logo_reactive={}, load_index={}, halo={}",
                         self.effects.pulse,
                         self.effects.scanlines,
                         self.effects.matrix,
                         self.effects.border_noise,
                         self.effects.badges,
                         self.effects.logo_reactive,
-                        self.effects.load_index
+                        self.effects.load_index,
+                        halo,
                     ),
                 });
             }
@@ -941,31 +852,43 @@ impl App {
                     message: format!("effects: all={}", if enable { "on" } else { "off" }),
                 });
             }
-            "save" => match self.effects.save_to_disk() {
-                Ok(()) => {
-                    let path_str = VisualEffects::config_path()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "<unknown>".to_string());
-                    events.push(AppEvent {
-                        kind: AppEventKind::System,
-                        message: format!("effects: configuration saved to {path_str}"),
-                    });
-                }
-                Err(e) => {
-                    events.push(AppEvent {
-                        kind: AppEventKind::Error,
-                        message: format!("effects: failed to save configuration: {e}"),
-                    });
-                }
-            },
-            field => {
+            "halo" => {
                 let value_word = parts.next();
                 let Some(value_word) = value_word else {
                     events.push(AppEvent {
                         kind: AppEventKind::Error,
                         message:
-                            "effects: usage: effects <pulse|scanlines|matrix|border|badges|logo|load> <on|off>"
+                            "effects: usage: effects halo <off|c3|c3narrow|c3wide|c3extrawide>"
                                 .to_string(),
+                    });
+                    return Some(events);
+                };
+
+                match LogoHaloProfile::from_str_kind(value_word) {
+                    Some(profile) => {
+                        self.effects.logo_halo = profile;
+                        events.push(AppEvent {
+                            kind: AppEventKind::System,
+                            message: format!("effects: halo={}", profile.as_str()),
+                        });
+                    }
+                    None => {
+                        events.push(AppEvent {
+                            kind: AppEventKind::Error,
+                            message: format!(
+                                "effects: unknown halo profile `{}` (expected: off|c3|c3narrow|c3wide|c3extrawide)",
+                                value_word
+                            ),
+                        });
+                    }
+                }
+            }
+            field => {
+                let value_word = parts.next();
+                let Some(value_word) = value_word else {
+                    events.push(AppEvent {
+                        kind: AppEventKind::Error,
+                        message: "effects: usage: effects <pulse|scanlines|matrix|border|badges|logo|load> <on|off> or effects halo <off|c3|c3narrow|c3wide|c3extrawide>".to_string(),
                     });
                     return Some(events);
                 };
@@ -1061,19 +984,36 @@ impl App {
 pub fn create_mock_app() -> (App, MockBackend) {
     let backend = MockBackend::new();
     let initial_vms = backend.initial_vms();
-    let app = App::new(initial_vms);
+    let mut app = App::new(initial_vms);
+
+    // If a global TUI config exists, apply halo profile at startup
+    // while leaving all other effects at their defaults.
+    if let Some(cfg) = TuiConfig::load() {
+        app.effects.logo_halo = cfg.logo_halo;
+    }
+
     (app, backend)
 }
 
 /// Helper to construct the App + backend pair used by `main`,
-/// automatically selecting the backend:
+/// automatically selecting the backend.
 ///
-/// 1. Try daemon backend first.
-/// 2. On failure, fall back to mock backend and emit a System event.
-pub fn create_app_autodetect() -> (App, Box<dyn ChalybsBackend>) {
+/// This version matches the signature used in `main.rs`:
+///
+///     let tui_config = TuiConfig::load();
+///     let (mut app, mut backend) = create_app_autodetect(tui_config);
+///
+/// The config is accepted and used only to seed the initial halo
+/// profile; behavior is otherwise identical.
+pub fn create_app_autodetect(tui_config: Option<TuiConfig>) -> (App, Box<dyn ChalybsBackend>) {
     match DaemonBackend::connect_default() {
         Ok(daemon) => {
             let mut app = App::new(daemon.initial_vms());
+
+            if let Some(cfg) = tui_config {
+                app.effects.logo_halo = cfg.logo_halo;
+            }
+
             app.daemon_health = DaemonHealth::Healthy;
             app.daemon_health_clean_runs = 0;
             app.push_events(vec![AppEvent {
@@ -1084,6 +1024,11 @@ pub fn create_app_autodetect() -> (App, Box<dyn ChalybsBackend>) {
         }
         Err(err) => {
             let (mut app, mock) = create_mock_app();
+
+            if let Some(cfg) = tui_config {
+                app.effects.logo_halo = cfg.logo_halo;
+            }
+
             app.daemon_health = DaemonHealth::Disconnected;
             app.daemon_health_clean_runs = 0;
             app.push_events(vec![AppEvent {

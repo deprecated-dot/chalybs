@@ -123,3 +123,62 @@ pub fn modal_bg() -> Style {
         .bg(palette::PANEL_BG)
         .fg(palette::TEXT_NORMAL)
 }
+
+/// ---------------------------------------------------------------------------
+/// BRIGHTNESS HELPERS
+/// ---------------------------------------------------------------------------
+///
+/// These helpers are used by the logo breathing engine and the new
+/// A+C sparkline coherence system. They never modify palette constants
+/// and are purely multiplicative brightness transforms.
+
+/// Clamp helper: bound RGB channel to [0,255].
+fn clamp_channel(v: f32) -> u8 {
+    if v < 0.0 {
+        0
+    } else if v > 255.0 {
+        255
+    } else {
+        v as u8
+    }
+}
+
+/// Adjust brightness of an RGB color by a multiplicative factor.
+/// Produces more aggressive shaping used by the main logo breathing.
+///
+/// This is exactly the same as in your canonical version — unchanged.
+pub(crate) fn adjust_brightness(color: Color, factor: f32) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => {
+            let fr = clamp_channel(r as f32 * factor);
+            let fg = clamp_channel(g as f32 * factor);
+            let fb = clamp_channel(b as f32 * factor);
+            Color::Rgb(fr, fg, fb)
+        }
+        other => other,
+    }
+}
+
+/// A softer brightness modulation used by the sparkline coherence path.
+///
+/// This avoids aggressive peaks and dips, keeping sparkline glyphs readable
+/// while still subtly tying their amplitude to breathing + matrix phase.
+///
+/// - factor ~0.8..1.2 → compressed into ~0.92..1.08
+/// - fully deterministic
+/// - non-destructive
+pub(crate) fn adjust_brightness_soft(color: Color, factor: f32) -> Color {
+    // Compress the brightness range before applying:
+    // This keeps the sparkline motion subtle and avoids hard jumps.
+    let softened = 1.0 + ((factor - 1.0) * 0.35);
+
+    match color {
+        Color::Rgb(r, g, b) => {
+            let fr = clamp_channel(r as f32 * softened);
+            let fg = clamp_channel(g as f32 * softened);
+            let fb = clamp_channel(b as f32 * softened);
+            Color::Rgb(fr, fg, fb)
+        }
+        other => other,
+    }
+}
