@@ -1,7 +1,84 @@
+
 # Chalybs CHANGELOG
 
 > This changelog documents user-visible changes.  
 > For deeper architectural details, see `CHALYBS_EXECUTION_AND_ARCHITECTURE.md`.
+
+---
+
+## v1.1.0 – PNG Logo & Halo Pipeline (Experimental)
+
+**Status:** local-only / not yet packaged
+
+### Added
+
+- Experimental **PNG logo renderer** and **Set C halo pipeline** in the TUI:
+  - `tui/src/logo_png.rs` now handles Kitty/iTerm backends via `viuer` and
+    renders a transparent PNG logo where supported.
+  - `VisualEffects` gains a canonical `logo_halo: LogoHaloProfile` field with
+    profiles: `off`, `c3`, `c3narrow`, `c3wide`, `c3extrawide`.
+  - New `effects halo <off|c3|c3narrow|c3wide|c3extrawide>` shell command
+    controls halo profile at runtime.
+  - Set C halo masks (C3, C3Narrow, C3Wide, C3ExtraWide) defined as
+    deterministic 7×7 intensity fields per side.
+
+- **Logo breathing exports** for TUI coherence:
+  - `logo_breath_factor(tick: u64) -> f32` – primary brightness factor for
+    logo + sparkline coherence.
+  - `logo_breath_coherence(tick: u64, salt: u64) -> f32` – secondary 0..1
+    signal used by header and per-VM sparklines for a shared “heartbeat”.
+
+- **Copilot contract & halo bug reference docs**:
+  - `CHALYBS_COPILOT_CONTRACT.md` – formal rules for ChatGPT-as-copilot,
+    including full-drop-in guarantees, immutability after tagging, and
+    TUI/halo-specific constraints.
+  - `HALO_RENDERING_BUG_REFERENCE.md` – a dedicated capsule explaining the
+    misaligned halo issue, geometry expectations, and acceptance criteria for
+    future fixes.
+
+### Changed
+
+- `tui/src/logo.rs`:
+  - Now delegates the upper portion of the status-panel logo slot to
+    `logo_png::draw_png_logo()` when an image backend and PNG are available.
+  - Renders a compact breathing caption (“CHALYBS ⟐”) in reserved bottom rows
+    when the PNG path is active; ASCII logo behavior is preserved as the
+    fallback when PNG is unavailable.
+  - Exposes the public breathing helpers (`logo_breath_factor`,
+    `logo_breath_coherence`) for other TUI effects.
+
+- `tui/src/app.rs`:
+  - `VisualEffects` updated to include the canonical `logo_halo` profile,
+    seeded from `TuiConfig` if present.
+  - `effects halo ...` subcommand now routes through `LogoHaloProfile` and
+    reports the active profile by name in `effects status`.
+
+- `tui/src/ui.rs`:
+  - `draw_status_panel` now uses `logo::draw_logo(...)` for hybrid ASCII/PNG
+    rendering, keeping all logo logic centralized in `logo.rs`.
+
+### Known Issues
+
+- The Set C halo is still **visually incorrect**:
+  - Wings can be vertically cropped at the bottom.
+  - Horizontal placement is not yet consistently centered around the PNG; in
+    some configurations the halo appears “too high” in the status panel.
+  - Overall aesthetic is not yet aligned with the desired Gibson-ish,
+    low-key console glow and can read as “neon club” in some profiles.
+
+- As a result, the halo is considered **experimental** and should remain
+  **off by default** (`halo = off`) for production use in v1.1.0.
+
+For details, see `HALO_RENDERING_BUG_REFERENCE.md`.
+
+### Notes
+
+- Core daemon (chalybsd) execution model, PCI pipeline, and VM orchestration
+  remain unchanged from v0.5.0 / v0.4.1.
+- The TUI visual effects baseline from v1.0.0 is preserved; the PNG/halo layer
+  is additive and cosmetic only.
+- v1.1.0 is primarily a **TUI checkpoint** plus documentation and process
+  hardening (copilot contract, bug capsule).
 
 ---
 

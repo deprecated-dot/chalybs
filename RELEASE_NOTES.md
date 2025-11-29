@@ -1,7 +1,107 @@
+
 # Chalybs v0.5.0 Release Notes
 
 > **Status:** Released  
 > **Primary Focus:** Introduction of the complete Chalybs Terminal UI (TUI)
+
+---
+
+## v1.1.0 – PNG Logo + Halo Pipeline (Experimental) & Process Hardening
+
+### Highlights
+
+- Introduces an experimental **PNG logo renderer** and **Set C halo** in the
+  TUI status panel:
+  - PNG logo rendered via `viuer` on Kitty/iTerm-capable terminals.
+  - Hybrid logo path: PNG where available, ASCII fallback otherwise.
+  - Narrow, dual-wing halo profiles controlled via the `effects halo` command.
+
+- Formalizes process & documentation around TUI work:
+  - **CHALYBS_COPILOT_CONTRACT.md** – explicit rules for ChatGPT-as-copilot,
+    including full-drop-in requirements and immutability after tagging.
+  - **HALO_RENDERING_BUG_REFERENCE.md** – captures the misaligned halo issue
+    in detail to prevent future debugging loops.
+
+- Treats the halo as an **experimental**, cosmetic-only feature:
+  - Off by default for production usage.
+  - Clearly documented as a known issue, with future work scheduled in the
+    roadmap.
+
+### Key Changes
+
+#### 1. TUI Logo & Halo
+
+- `tui/src/logo.rs`:
+  - Now delegates the top segment of the status panel’s logo slot to
+    `logo_png::draw_png_logo` for PNG rendering.
+  - When PNG is active, renders a compact breathing caption (“CHALYBS ⟐”) in
+    the reserved lower rows.
+  - Preserves the full ASCII logo path as the fallback; behavior is unchanged
+    when PNG is unavailable.
+
+- `tui/src/logo_png.rs`:
+  - Detects Kitty vs iTerm backends and dispatches to `viuer` appropriately.
+  - Implements Set C halo masks and breathing color logic tied to
+    `logo_breath_factor`.
+  - Draws a dual-wing halo band *behind* the PNG in a narrow region around the
+    logo when halo is enabled.
+
+- `tui/src/app.rs`:
+  - `VisualEffects` extended with `logo_halo: LogoHaloProfile`.
+  - `effects halo <off|c3|c3narrow|c3wide|c3extrawide>` wired into the local
+    shell, with `effects status` reporting the active profile.
+
+#### 2. Breathing Signals (Shared Rhythm)
+
+- `tui/src/logo.rs` exports two breathing helpers:
+  - `logo_breath_factor(tick)` – mapped to ~0.88..1.12, used for brightness
+    modulation.
+  - `logo_breath_coherence(tick, salt)` – a 0..1 factor used to avoid
+    perfectly phase-locked VM load sparklines and other effects.
+
+These are used by:
+
+- Header `[load ...]` sparkline.
+- Per-VM load indicators in the status panel.
+- Halo color blending and rune breathing.
+
+#### 3. Documentation & Process
+
+- **Copilot contract**:
+  - All future ChatGPT work on Chalybs must follow the explicit rules in
+    `CHALYBS_COPILOT_CONTRACT.md` (full drop-ins, no arbitrary refactors, no
+    breaking already-tagged behavior without explicit consent).
+
+- **Halo bug reference**:
+  - The misaligned / cropped halo behavior is explicitly documented as a
+    known issue, not swept under the rug.
+  - Future halo iterations are expected to use this doc as a starting point.
+
+### Upgrading from v1.0.0
+
+- Core daemon, PCI pipeline, and TUI visual effects engine from v1.0.0 remain
+  unchanged.
+- v1.1.0 adds:
+  - The PNG logo path and halo pipeline on top of the existing TUI.
+  - Additional docs and process hardening.
+
+No config migrations are required. For most users, the primary behavioral
+difference is the presence of a PNG logo (when the terminal supports it) and
+the ability to experiment with `effects halo ...`.
+
+### Known Limitations / Current Status
+
+- Halo geometry is **not yet correct** in all cases:
+  - Wings can be cropped on the bottom edge.
+  - Placement may be vertically or horizontally off relative to the PNG.
+- Aesthetic tuning is incomplete:
+  - Some profiles read as “neon club” rather than a restrained Gibson-ish
+    console glow.
+
+Because of this, halo is considered **experimental** and is recommended to be
+**off by default** in real work sessions. See
+`HALO_RENDERING_BUG_REFERENCE.md` for the full story and future acceptance
+criteria.
 
 ---
 
