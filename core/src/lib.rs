@@ -1,15 +1,16 @@
-pub mod errors;
-pub mod logging;
-pub mod config;
-pub mod model;
-pub mod state;
-pub mod cpuset;
-pub mod qemu;
 pub mod affinity;
+pub mod config;
+pub mod cpu;
+pub mod cpuset;
+pub mod errors;
 pub mod irq;
-pub mod util;
+pub mod logging;
+pub mod model;
 pub mod pci;
-pub mod vfio;
 pub mod peripherals;
+pub mod qemu;
+pub mod state;
+pub mod util;
+pub mod vfio;
 
 pub use errors::{ChalybsError, Result};

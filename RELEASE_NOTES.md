@@ -1,3 +1,14 @@
+# Chalybs v1.1.1 Release Notes
+
+## Overview
+v1.1.1 replaces the synthetic TUI backend with real VM lifecycle orchestration and integrates the new segmented state machine into the daemon. Deterministic VM bring-up, shutdown, and event bridging are now functional.
+
+### Highlights
+- Real VM lifecycle (Init→Steady→Idle) via VmStateMachine
+- Removal of synthetic backend
+- Deterministic per-tick scheduling
+- Full CoreEvent → IPC event projection
+
 
 # Chalybs v0.5.0 Release Notes
 

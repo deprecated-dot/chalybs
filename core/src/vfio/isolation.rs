@@ -4,9 +4,11 @@ use std::collections::{HashMap, HashSet};
 
 use tracing::{info, warn};
 
-use crate::config::{IsolationMode, IsolationPolicyConfig, PciDeviceConfig, VmConfig};
+use crate::config::{
+    IsolationLevel, IsolationMode, IsolationPolicyConfig, PciDeviceConfig, VmConfig,
+};
 use crate::errors::{ChalybsError, Result};
-use crate::pci::{GpuSafetyClass, PciFunction, PciInventory};
+use crate::pci::{DeviceClass, GpuSafetyClass, PciFunction, PciInventory};
 
 /// Severity of a single isolation finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +43,21 @@ impl IsolationReport {
     }
 }
 
-/// Phase 8: Evaluate device isolation policy for a VM.
+/// Per-device context for Phase 9 isolation-level evaluation.
+///
+/// This ties together:
+///   - the PciDeviceConfig (including IsolationLevel override)
+///   - the resolved PciFunction
+///   - deterministic DeviceClass classification
+///   - the effective IsolationLevel for this device
+struct DeviceIsolationContext<'a> {
+    device_cfg: &'a PciDeviceConfig,
+    func: &'a PciFunction,
+    class: DeviceClass,
+    effective_level: IsolationLevel,
+}
+
+/// Phase 8/9/NUMA: Evaluate device isolation policy for a VM.
 ///
 /// This is a pure, read-only pass over the current PCI inventory and
 /// the VM's configuration. Depending on the per-VM IsolationMode:
@@ -50,6 +66,15 @@ impl IsolationReport {
 /// - Audit    → log findings but never block.
 /// - Enforce  → treat any Violation as a hard error and abort VFIO
 ///   staging before touching sysfs.
+///
+/// Semantics layered in order:
+///   - Phase 8: IOMMU-group exclusivity, multi-function consistency,
+///              host-critical GPU sharing.
+///   - Phase 9: per-device IsolationLevel semantics (Forbidden,
+///              Dedicated, SharedWithHost).
+///   - NUMA:    VM NUMA node vs device NUMA node for passthrough
+///              devices, with strict behavior for Dedicated in Enforce
+///              mode.
 pub fn evaluate_isolation_for_vm(vm_name: &str, cfg: &VmConfig, inv: &PciInventory) -> Result<()> {
     let policy: &IsolationPolicyConfig = &cfg.isolation;
 
@@ -57,20 +82,20 @@ pub fn evaluate_isolation_for_vm(vm_name: &str, cfg: &VmConfig, inv: &PciInvento
         IsolationMode::Disabled => {
             info!(
                 vm = vm_name,
-                "vfio: isolation mode Disabled; skipping Phase 8 checks"
+                "vfio: isolation mode Disabled; skipping Phase 8/9/NUMA checks"
             );
             return Ok(());
         }
         IsolationMode::Audit => {
             info!(
                 vm = vm_name,
-                "vfio: isolation mode Audit; evaluating Phase 8 checks (non-blocking)"
+                "vfio: isolation mode Audit; evaluating Phase 8/9/NUMA checks (non-blocking)"
             );
         }
         IsolationMode::Enforce => {
             info!(
                 vm = vm_name,
-                "vfio: isolation mode Enforce; evaluating Phase 8 checks (blocking on violations)"
+                "vfio: isolation mode Enforce; evaluating Phase 8/9/NUMA checks (blocking on violations)"
             );
         }
     }
@@ -79,6 +104,9 @@ pub fn evaluate_isolation_for_vm(vm_name: &str, cfg: &VmConfig, inv: &PciInvento
 
     // Build a set of all passthrough BDFs that resolve in inventory.
     let passthrough_bdfs = collect_passthrough_bdfs(cfg, inv)?;
+
+    // Build per-device isolation contexts for Phase 9 + NUMA evaluation.
+    let device_contexts = collect_device_contexts(policy, cfg, inv)?;
 
     // 1) IOMMU-group exclusivity.
     if policy.require_iommu_exclusive {
@@ -95,6 +123,33 @@ pub fn evaluate_isolation_for_vm(vm_name: &str, cfg: &VmConfig, inv: &PciInvento
     if policy.forbid_host_critical_in_group {
         evaluate_host_critical_sharing(vm_name, inv, &passthrough_bdfs, &mut findings);
     }
+
+    // 4) Phase 9: per-device IsolationLevel semantics layered on top
+    //    of the existing group-oriented checks.
+    if !device_contexts.is_empty() {
+        evaluate_per_device_isolation_levels(
+            vm_name,
+            policy,
+            inv,
+            &device_contexts,
+            &passthrough_bdfs,
+            &mut findings,
+        );
+    }
+
+    // 5) NUMA placement: VM NUMA node vs device NUMA node.
+    //
+    // Strict semantics for Dedicated in Enforce mode:
+    //   - Audit: warning only.
+    //   - Enforce: violation.
+    evaluate_numa_placement(
+        vm_name,
+        policy,
+        cfg,
+        &device_contexts,
+        &passthrough_bdfs,
+        &mut findings,
+    );
 
     let report = IsolationReport {
         vm_name: vm_name.to_string(),
@@ -156,6 +211,334 @@ fn collect_devices_for_kind(
     }
 
     Ok(())
+}
+
+/// Build per-device isolation contexts for all configured passthrough
+/// devices (GPU, NVMe, NIC, USB).
+///
+/// This reuses resolve_configured() to preserve existing semantics
+/// around required/optional devices and inventory resolution.
+fn collect_device_contexts<'a>(
+    policy: &IsolationPolicyConfig,
+    cfg: &'a VmConfig,
+    inv: &'a PciInventory,
+) -> Result<Vec<DeviceIsolationContext<'a>>> {
+    let mut ctxs: Vec<DeviceIsolationContext<'a>> = Vec::new();
+
+    collect_device_contexts_for_kind(cfg.devices.gpu.as_ref(), policy, inv, &mut ctxs)?;
+    collect_device_contexts_for_kind(cfg.devices.nvme.as_ref(), policy, inv, &mut ctxs)?;
+    collect_device_contexts_for_kind(cfg.devices.nic.as_ref(), policy, inv, &mut ctxs)?;
+    collect_device_contexts_for_kind(cfg.devices.usb.as_ref(), policy, inv, &mut ctxs)?;
+
+    Ok(ctxs)
+}
+
+fn collect_device_contexts_for_kind<'a>(
+    cfgs_opt: Option<&'a Vec<PciDeviceConfig>>,
+    policy: &IsolationPolicyConfig,
+    inv: &'a PciInventory,
+    out: &mut Vec<DeviceIsolationContext<'a>>,
+) -> Result<()> {
+    let cfgs = match cfgs_opt {
+        Some(c) if !c.is_empty() => c,
+        _ => return Ok(()),
+    };
+
+    // Map BDF → config so we can associate resolved functions with
+    // their PciDeviceConfig deterministically.
+    let mut cfg_by_bdf: HashMap<&str, &PciDeviceConfig> = HashMap::new();
+    for dev_cfg in cfgs {
+        cfg_by_bdf.insert(dev_cfg.pci_address.as_str(), dev_cfg);
+    }
+
+    let funcs = inv.resolve_configured(cfgs)?;
+
+    for func in funcs {
+        match cfg_by_bdf.get(func.bdf.as_str()) {
+            Some(dev_cfg) => {
+                let effective_level = dev_cfg.level.unwrap_or(policy.default_level);
+                let class = func.device_class();
+
+                out.push(DeviceIsolationContext {
+                    device_cfg: *dev_cfg,
+                    func,
+                    class,
+                    effective_level,
+                });
+            }
+            None => {
+                // This should not normally occur; if it does, we log and
+                // skip rather than guessing.
+                warn!(
+                    bdf = func.bdf.as_str(),
+                    "vfio: resolved PCI device has no matching PciDeviceConfig; \
+                     skipping per-device isolation-level evaluation for this device"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Evaluate per-device IsolationLevel semantics (Phase 9) on top of the
+/// existing Phase 8 group-level checks.
+///
+/// Semantics in this phase:
+///   - Forbidden:
+///       Any device marked Forbidden and configured for passthrough is
+///       a Violation.
+///   - Dedicated:
+///       When require_iommu_exclusive == false, enforce that this
+///       device's IOMMU group is exclusive to passthrough devices.
+///       When require_iommu_exclusive == true, Phase 8 already enforces
+///       exclusivity; we do not add extra violations.
+///   - SharedWithHost:
+///       Advisory only in this phase; no additional violations.
+fn evaluate_per_device_isolation_levels(
+    vm_name: &str,
+    policy: &IsolationPolicyConfig,
+    inv: &PciInventory,
+    device_contexts: &[DeviceIsolationContext<'_>],
+    passthrough_bdfs: &HashSet<String>,
+    findings: &mut Vec<IsolationFinding>,
+) {
+    if device_contexts.is_empty() {
+        return;
+    }
+
+    let groups = inv.by_iommu_group();
+
+    for ctx in device_contexts {
+        match ctx.effective_level {
+            IsolationLevel::Forbidden => {
+                let message = format!(
+                    "PCI device {} is configured for passthrough but IsolationLevel=forbidden \
+                     for VM {vm_name}",
+                    ctx.func.bdf
+                );
+
+                findings.push(IsolationFinding {
+                    severity: IsolationSeverity::Violation,
+                    code: "DEVICE_FORBIDDEN_BY_POLICY",
+                    message,
+                    device_bdf: Some(ctx.func.bdf.clone()),
+                    iommu_group: ctx.func.iommu_group,
+                });
+            }
+
+            IsolationLevel::Dedicated => {
+                // When require_iommu_exclusive is true, Phase 8 already enforces
+                // group exclusivity at the VM level. We deliberately avoid
+                // double-reporting here and only add per-device exclusivity
+                // findings when the global flag is relaxed.
+                if !policy.require_iommu_exclusive {
+                    match ctx.func.iommu_group {
+                        None => {
+                            let message = format!(
+                                "PCI device {} with IsolationLevel=dedicated has no IOMMU group; \
+                                 cannot evaluate group exclusivity for VM {vm_name}",
+                                ctx.func.bdf
+                            );
+
+                            findings.push(IsolationFinding {
+                                severity: IsolationSeverity::Warning,
+                                code: "DEVICE_DEDICATED_NO_IOMMU_GROUP",
+                                message,
+                                device_bdf: Some(ctx.func.bdf.clone()),
+                                iommu_group: None,
+                            });
+                        }
+                        Some(gid) => {
+                            let members = match groups.get(&gid) {
+                                Some(m) => m,
+                                None => {
+                                    let message = format!(
+                                        "PCI device {} with IsolationLevel=dedicated is in \
+                                         IOMMU group {gid}, but group members are not present \
+                                         in the current inventory snapshot for VM {vm_name}",
+                                        ctx.func.bdf
+                                    );
+
+                                    findings.push(IsolationFinding {
+                                        severity: IsolationSeverity::Warning,
+                                        code: "DEVICE_DEDICATED_GROUP_UNKNOWN",
+                                        message,
+                                        device_bdf: Some(ctx.func.bdf.clone()),
+                                        iommu_group: Some(gid),
+                                    });
+
+                                    continue;
+                                }
+                            };
+
+                            let mut non_passthrough: Vec<String> = Vec::new();
+                            for m in members {
+                                if !passthrough_bdfs.contains(&m.bdf) {
+                                    non_passthrough.push(m.bdf.clone());
+                                }
+                            }
+
+                            if non_passthrough.is_empty() {
+                                let message = format!(
+                                    "PCI device {} with IsolationLevel=dedicated is in IOMMU \
+                                     group {gid} that is exclusive to passthrough devices \
+                                     for VM {vm_name}",
+                                    ctx.func.bdf
+                                );
+
+                                findings.push(IsolationFinding {
+                                    severity: IsolationSeverity::Info,
+                                    code: "DEVICE_DEDICATED_GROUP_EXCLUSIVE",
+                                    message,
+                                    device_bdf: Some(ctx.func.bdf.clone()),
+                                    iommu_group: Some(gid),
+                                });
+                            } else {
+                                let message = format!(
+                                    "PCI device {} with IsolationLevel=dedicated is in IOMMU \
+                                     group {gid} that also contains non-passthrough members ({}); \
+                                     this violates per-device dedicated isolation for VM {vm_name}",
+                                    ctx.func.bdf,
+                                    non_passthrough.join(","),
+                                );
+
+                                findings.push(IsolationFinding {
+                                    severity: IsolationSeverity::Violation,
+                                    code: "DEVICE_DEDICATED_GROUP_NOT_EXCLUSIVE",
+                                    message,
+                                    device_bdf: Some(ctx.func.bdf.clone()),
+                                    iommu_group: Some(gid),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            IsolationLevel::SharedWithHost => {
+                // In this phase, SharedWithHost is advisory only. We do not
+                // override existing Phase 8 group-level behavior nor do we
+                // introduce new violations based solely on this level.
+            }
+        }
+    }
+}
+
+/// Evaluate NUMA placement semantics on top of Phase 8/9:
+///
+/// - Only enforced when the VM has an explicit NUMA node set.
+/// - Devices with IsolationLevel::Dedicated are treated strictly:
+///     * Audit   → WARN on mismatch
+///     * Enforce → VIOLATION on mismatch
+/// - Devices with IsolationLevel::SharedWithHost are advisory:
+///     * Audit/Enforce → WARN on mismatch
+/// - Devices with negative or unknown NUMA nodes produce WARN, never
+///   VIOLATION, regardless of mode.
+fn evaluate_numa_placement(
+    vm_name: &str,
+    policy: &IsolationPolicyConfig,
+    cfg: &VmConfig,
+    device_contexts: &[DeviceIsolationContext<'_>],
+    _passthrough_bdfs: &HashSet<String>,
+    findings: &mut Vec<IsolationFinding>,
+) {
+    if device_contexts.is_empty() {
+        return;
+    }
+
+    // If the VM is not pinned to a NUMA node, we do not attempt to
+    // enforce NUMA semantics. Determinism here requires explicit
+    // configuration.
+    let vm_node_opt: Option<u16> = cfg.numa.as_ref().and_then(|n| n.node);
+    let vm_node = match vm_node_opt {
+        Some(n) => n,
+        None => return,
+    };
+
+    for ctx in device_contexts {
+        let dev_node_opt = ctx.func.numa_node;
+
+        // Unknown NUMA node for the device.
+        let dev_node = match dev_node_opt {
+            None => {
+                let message = format!(
+                    "PCI device {} has unknown NUMA node (None) while VM {vm_name} is pinned to node {vm_node}",
+                    ctx.func.bdf
+                );
+
+                findings.push(IsolationFinding {
+                    severity: IsolationSeverity::Warning,
+                    code: "NUMA_DEVICE_NODE_UNKNOWN",
+                    message,
+                    device_bdf: Some(ctx.func.bdf.clone()),
+                    iommu_group: ctx.func.iommu_group,
+                });
+
+                continue;
+            }
+            Some(n) if n < 0 => {
+                let message = format!(
+                    "PCI device {} reports negative NUMA node ({n}) while VM {vm_name} is pinned to node {vm_node}; \
+                     treating as warning but not violation",
+                    ctx.func.bdf
+                );
+
+                findings.push(IsolationFinding {
+                    severity: IsolationSeverity::Warning,
+                    code: "NUMA_DEVICE_NODE_NEGATIVE",
+                    message,
+                    device_bdf: Some(ctx.func.bdf.clone()),
+                    iommu_group: ctx.func.iommu_group,
+                });
+
+                continue;
+            }
+            Some(n) => n,
+        };
+
+        // Exact match: no finding, this is the ideal case.
+        if dev_node as u16 == vm_node {
+            continue;
+        }
+
+        // NUMA mismatch. Severity depends on effective level + mode.
+        let (severity, level_label) = match ctx.effective_level {
+            IsolationLevel::Forbidden => {
+                // Already handled elsewhere; no need to double count.
+                continue;
+            }
+            IsolationLevel::Dedicated => match policy.mode {
+                IsolationMode::Disabled => (IsolationSeverity::Warning, "dedicated"),
+                IsolationMode::Audit => (IsolationSeverity::Warning, "dedicated"),
+                IsolationMode::Enforce => (IsolationSeverity::Violation, "dedicated"),
+            },
+            IsolationLevel::SharedWithHost => {
+                // Advisory in all modes: NUMA mismatch is warned about
+                // but never escalated to a violation.
+                (IsolationSeverity::Warning, "shared-with-host")
+            }
+        };
+
+        let message = format!(
+            "PCI device {} with IsolationLevel={} is on NUMA node {} but VM {vm_name} is pinned to node {}; \
+             this NUMA mismatch is treated as {:?} under mode {:?}",
+            ctx.func.bdf,
+            level_label,
+            dev_node,
+            vm_node,
+            severity,
+            policy.mode,
+        );
+
+        findings.push(IsolationFinding {
+            severity,
+            code: "NUMA_NODE_MISMATCH",
+            message,
+            device_bdf: Some(ctx.func.bdf.clone()),
+            iommu_group: ctx.func.iommu_group,
+        });
+    }
 }
 
 /// Evaluate IOMMU-group exclusivity: any IOMMU group that contains at
@@ -388,7 +771,7 @@ fn log_report(report: &IsolationReport) {
     if report.findings.is_empty() {
         info!(
             vm = report.vm_name.as_str(),
-            "vfio: Phase 8 isolation evaluation produced no findings"
+            "vfio: Phase 8/9/NUMA isolation evaluation produced no findings"
         );
         return;
     }
@@ -433,13 +816,18 @@ fn log_report(report: &IsolationReport) {
 mod tests {
     use super::*;
     use crate::config::{
-        CpuConfig, DevicesConfig, GpuPolicyConfig, IsolationMode, IsolationPolicyConfig,
-        NumaConfig, PciDeviceConfig, QemuConfig,
+        CpuConfig, DevicesConfig, GpuPolicyConfig, IsolationLevel, IsolationMode,
+        IsolationPolicyConfig, NumaConfig, PciDeviceConfig, QemuConfig,
     };
     use crate::pci::{PciFunction, PciInventory};
     use std::collections::HashSet;
 
-    fn make_gpu(bdf: &str, driver: Option<&str>, iommu_group: Option<u32>) -> PciFunction {
+    fn make_gpu(
+        bdf: &str,
+        driver: Option<&str>,
+        iommu_group: Option<u32>,
+        numa_node: Option<i32>,
+    ) -> PciFunction {
         PciFunction {
             bdf: bdf.to_string(),
             vendor_id: 0x1234,
@@ -447,7 +835,7 @@ mod tests {
             class: 0x030000, // display controller
             driver: driver.map(|d| d.to_string()),
             iommu_group,
-            numa_node: Some(0),
+            numa_node,
         }
     }
 
@@ -456,6 +844,7 @@ mod tests {
         class: u32,
         driver: Option<&str>,
         iommu_group: Option<u32>,
+        numa_node: Option<i32>,
     ) -> PciFunction {
         PciFunction {
             bdf: bdf.to_string(),
@@ -464,7 +853,7 @@ mod tests {
             class,
             driver: driver.map(|d| d.to_string()),
             iommu_group,
-            numa_node: Some(0),
+            numa_node,
         }
     }
 
@@ -524,8 +913,8 @@ mod tests {
 
     #[test]
     fn iommu_exclusivity_flags_mixed_group() {
-        let pt = make_generic("0000:01:00.0", 0x020000, Some("e1000e"), Some(10));
-        let host = make_generic("0000:01:00.1", 0x020000, Some("e1000e"), Some(10));
+        let pt = make_generic("0000:01:00.0", 0x020000, Some("e1000e"), Some(10), Some(0));
+        let host = make_generic("0000:01:00.1", 0x020000, Some("e1000e"), Some(10), Some(0));
 
         let inv = PciInventory {
             functions: vec![pt.clone(), host.clone()],
@@ -546,8 +935,8 @@ mod tests {
     #[test]
     fn iommu_exclusivity_flags_cross_slot_shared_group() {
         // Cross-slot: different slot numbers but same IOMMU group.
-        let pt = make_generic("0000:01:00.0", 0x010802, Some("nvme"), Some(42));
-        let host = make_generic("0000:02:00.0", 0x020000, Some("e1000e"), Some(42));
+        let pt = make_generic("0000:01:00.0", 0x010802, Some("nvme"), Some(42), Some(0));
+        let host = make_generic("0000:02:00.0", 0x020000, Some("e1000e"), Some(42), Some(0));
 
         let inv = PciInventory {
             functions: vec![pt.clone(), host.clone()],
@@ -570,8 +959,8 @@ mod tests {
 
     #[test]
     fn multifunction_consistency_flags_mixed_functions() {
-        let pt = make_generic("0000:01:00.0", 0x020000, Some("e1000e"), Some(5));
-        let host = make_generic("0000:01:00.1", 0x020000, Some("e1000e"), Some(5));
+        let pt = make_generic("0000:01:00.0", 0x020000, Some("e1000e"), Some(5), Some(0));
+        let host = make_generic("0000:01:00.1", 0x020000, Some("e1000e"), Some(5), Some(0));
 
         let inv = PciInventory {
             functions: vec![pt.clone(), host.clone()],
@@ -592,8 +981,8 @@ mod tests {
     #[test]
     fn host_critical_sharing_flags_group_with_host_gpu() {
         // Passthrough NIC and host-owned GPU share an IOMMU group.
-        let nic = make_generic("0000:01:00.0", 0x020000, Some("e1000e"), Some(7));
-        let host_gpu = make_gpu("0000:01:00.1", Some("amdgpu"), Some(7));
+        let nic = make_generic("0000:01:00.0", 0x020000, Some("e1000e"), Some(7), Some(0));
+        let host_gpu = make_gpu("0000:01:00.1", Some("amdgpu"), Some(7), Some(0));
 
         let inv = PciInventory {
             functions: vec![nic.clone(), host_gpu.clone()],
@@ -614,8 +1003,8 @@ mod tests {
     #[test]
     fn host_critical_sharing_flags_group_with_passthrough_gpu_and_host_gpu() {
         // Multi-GPU scenario: one GPU is passthrough, the other is host-owned.
-        let pt_gpu = make_gpu("0000:03:00.0", Some("vfio-pci"), Some(9));
-        let host_gpu = make_gpu("0000:03:00.1", Some("amdgpu"), Some(9));
+        let pt_gpu = make_gpu("0000:03:00.0", Some("vfio-pci"), Some(9), Some(0));
+        let host_gpu = make_gpu("0000:03:00.1", Some("amdgpu"), Some(9), Some(0));
 
         let inv = PciInventory {
             functions: vec![pt_gpu.clone(), host_gpu.clone()],
@@ -639,11 +1028,11 @@ mod tests {
     #[test]
     fn evaluate_isolation_disabled_is_noop_even_with_issues() {
         let gpu_bdf = "0000:02:00.0";
-        let cfg = minimal_vm_with_gpu_and_isolation(gpu_bdf, IsolationMode::Disabled);
+        let mut cfg = minimal_vm_with_gpu_and_isolation(gpu_bdf, IsolationMode::Disabled);
 
         // Inventory with an obvious exclusivity violation.
-        let pt_gpu = make_gpu(gpu_bdf, Some("vfio-pci"), Some(3));
-        let host_dev = make_generic("0000:02:00.1", 0x020000, Some("e1000e"), Some(3));
+        let pt_gpu = make_gpu(gpu_bdf, Some("vfio-pci"), Some(3), Some(0));
+        let host_dev = make_generic("0000:02:00.1", 0x020000, Some("e1000e"), Some(3), Some(0));
 
         let inv = PciInventory {
             functions: vec![pt_gpu, host_dev],
@@ -656,11 +1045,11 @@ mod tests {
     #[test]
     fn evaluate_isolation_enforce_errors_on_violation() {
         let gpu_bdf = "0000:03:00.0";
-        let cfg = minimal_vm_with_gpu_and_isolation(gpu_bdf, IsolationMode::Enforce);
+        let mut cfg = minimal_vm_with_gpu_and_isolation(gpu_bdf, IsolationMode::Enforce);
 
         // Same exclusivity violation as previous test, but in Enforce mode.
-        let pt_gpu = make_gpu(gpu_bdf, Some("vfio-pci"), Some(4));
-        let host_dev = make_generic("0000:03:00.1", 0x020000, Some("e1000e"), Some(4));
+        let pt_gpu = make_gpu(gpu_bdf, Some("vfio-pci"), Some(4), Some(0));
+        let host_dev = make_generic("0000:03:00.1", 0x020000, Some("e1000e"), Some(4), Some(0));
 
         let inv = PciInventory {
             functions: vec![pt_gpu, host_dev],
@@ -669,5 +1058,230 @@ mod tests {
         let err = evaluate_isolation_for_vm("testvm", &cfg, &inv).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("device isolation policy violations detected"));
+    }
+
+    // ---------- NUMA tests -------------------------------------------------
+
+    fn vm_with_numa_and_single_gpu(
+        gpu_bdf: &str,
+        vm_node: u16,
+        mode: IsolationMode,
+        level: IsolationLevel,
+    ) -> VmConfig {
+        VmConfig {
+            cpu: CpuConfig {
+                host_cpus: "0-3".to_string(),
+                vm_cpus: "0-1".to_string(),
+            },
+            qemu: QemuConfig {
+                binary: "/usr/bin/qemu-system-x86_64".to_string(),
+                args: "".to_string(),
+                num_vcpus: 2,
+                mem_mb: 2048,
+                hugepages: false,
+                ovmf_code: "/usr/share/OVMF/OVMF_CODE.fd".to_string(),
+                ovmf_vars: "/var/lib/libvirt/qemu/nvram/test_VARS.fd".to_string(),
+            },
+            numa: Some(NumaConfig {
+                node: Some(vm_node),
+            }),
+            devices: DevicesConfig {
+                gpu: Some(vec![PciDeviceConfig {
+                    pci_address: gpu_bdf.to_string(),
+                    required: true,
+                    level: Some(level),
+                }]),
+                nvme: None,
+                nic: None,
+                usb: None,
+            },
+            gpu: GpuPolicyConfig {
+                allow_single_gpu: false,
+                force_use_igpu: false,
+            },
+            isolation: IsolationPolicyConfig {
+                mode,
+                ..IsolationPolicyConfig::default()
+            },
+            peripherals: None,
+        }
+    }
+
+    #[test]
+    fn numa_matching_nodes_produce_no_findings() {
+        let gpu_bdf = "0000:04:00.0";
+        let cfg = vm_with_numa_and_single_gpu(
+            gpu_bdf,
+            0,
+            IsolationMode::Enforce,
+            IsolationLevel::Dedicated,
+        );
+
+        let gpu = make_gpu(gpu_bdf, Some("vfio-pci"), Some(1), Some(0));
+
+        let inv = PciInventory {
+            functions: vec![gpu],
+        };
+
+        let mut findings = Vec::new();
+
+        let device_contexts =
+            collect_device_contexts(&cfg.isolation, &cfg, &inv).expect("device contexts");
+
+        evaluate_numa_placement(
+            "testvm",
+            &cfg.isolation,
+            &cfg,
+            &device_contexts,
+            &HashSet::new(),
+            &mut findings,
+        );
+
+        assert!(
+            findings.is_empty(),
+            "expected no NUMA findings for matching nodes, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn numa_mismatched_nodes_produce_warning_or_info_but_not_error_in_audit_mode() {
+        let gpu_bdf = "0000:05:00.0";
+        let cfg = vm_with_numa_and_single_gpu(
+            gpu_bdf,
+            0,
+            IsolationMode::Audit,
+            IsolationLevel::Dedicated,
+        );
+
+        // Device is on NUMA node 1, VM pinned to node 0.
+        let gpu = make_gpu(gpu_bdf, Some("vfio-pci"), Some(2), Some(1));
+
+        let inv = PciInventory {
+            functions: vec![gpu],
+        };
+
+        let mut findings = Vec::new();
+        let device_contexts =
+            collect_device_contexts(&cfg.isolation, &cfg, &inv).expect("device contexts");
+
+        evaluate_numa_placement(
+            "testvm",
+            &cfg.isolation,
+            &cfg,
+            &device_contexts,
+            &HashSet::new(),
+            &mut findings,
+        );
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.code == "NUMA_NODE_MISMATCH"
+                    && f.severity != IsolationSeverity::Violation),
+            "expected NUMA mismatch to produce non-violation finding in Audit mode, got: {findings:?}"
+        );
+
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.severity == IsolationSeverity::Violation),
+            "Audit mode must not treat NUMA mismatch as violation"
+        );
+    }
+
+    #[test]
+    fn numa_mismatched_nodes_violate_in_enforce_mode_for_dedicated_level() {
+        let gpu_bdf = "0000:06:00.0";
+        let cfg = vm_with_numa_and_single_gpu(
+            gpu_bdf,
+            0,
+            IsolationMode::Enforce,
+            IsolationLevel::Dedicated,
+        );
+
+        // Device is on NUMA node 1, VM pinned to node 0.
+        let gpu = make_gpu(gpu_bdf, Some("vfio-pci"), Some(3), Some(1));
+
+        let inv = PciInventory {
+            functions: vec![gpu],
+        };
+
+        let mut findings = Vec::new();
+        let device_contexts =
+            collect_device_contexts(&cfg.isolation, &cfg, &inv).expect("device contexts");
+
+        evaluate_numa_placement(
+            "testvm",
+            &cfg.isolation,
+            &cfg,
+            &device_contexts,
+            &HashSet::new(),
+            &mut findings,
+        );
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.code == "NUMA_NODE_MISMATCH"
+                    && f.severity == IsolationSeverity::Violation),
+            "Enforce mode + Dedicated level must treat NUMA mismatch as violation; findings: {findings:?}"
+        );
+
+        // Full isolation evaluation should error under these conditions.
+        let err = evaluate_isolation_for_vm("testvm", &cfg, &inv).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("device isolation policy violations detected"),
+            "expected isolation evaluation to fail due to NUMA violation, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn numa_negative_device_node_produces_warning_but_not_error() {
+        let gpu_bdf = "0000:07:00.0";
+        let cfg = vm_with_numa_and_single_gpu(
+            gpu_bdf,
+            0,
+            IsolationMode::Enforce,
+            IsolationLevel::Dedicated,
+        );
+
+        // Device reports negative NUMA node (e.g., -1).
+        let gpu = make_gpu(gpu_bdf, Some("vfio-pci"), Some(4), Some(-1));
+
+        let inv = PciInventory {
+            functions: vec![gpu],
+        };
+
+        let mut findings = Vec::new();
+        let device_contexts =
+            collect_device_contexts(&cfg.isolation, &cfg, &inv).expect("device contexts");
+
+        evaluate_numa_placement(
+            "testvm",
+            &cfg.isolation,
+            &cfg,
+            &device_contexts,
+            &HashSet::new(),
+            &mut findings,
+        );
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.code == "NUMA_DEVICE_NODE_NEGATIVE"
+                    && f.severity == IsolationSeverity::Warning),
+            "expected negative NUMA node to produce warning finding, got: {findings:?}"
+        );
+
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.severity == IsolationSeverity::Violation),
+            "negative NUMA node must not produce violation"
+        );
+
+        // Full isolation evaluation should still succeed (no hard error).
+        evaluate_isolation_for_vm("testvm", &cfg, &inv).unwrap();
     }
 }
