@@ -153,3 +153,11 @@ acceptance criteria for “fixed”.
 
 The roadmap is a living document; each tagged release must update this file to
 reflect what actually shipped and what moved to the next horizon.
+
+## Phase 10A: Synthetic Removal — Completed
+- All synthetic VM and event paths removed.
+- Daemon now reflects real config + PCI + state machines.
+
+## Phase 11: Real Daemon/Core Integration — Completed
+- Real VmStateMachine tied into daemon tick.
+- IPC snapshot now reflects live VM states and events.

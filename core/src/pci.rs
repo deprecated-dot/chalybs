@@ -93,6 +93,20 @@ pub enum GpuUnbindFeasibility {
     Unsafe(String),
 }
 
+/// Logical classification of a PCI function for policy purposes.
+///
+/// This is *purely* derived from the PCI class code and existing
+/// helpers; there are no external tools or additional heuristics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceClass {
+    Gpu,
+    Nvme,
+    Nic,
+    UsbController,
+    StorageOther,
+    Other,
+}
+
 impl PciFunction {
     /// Return the (base, sub, prog_if) triple derived from the raw class.
     ///
@@ -184,6 +198,24 @@ impl PciFunction {
     pub fn is_usb_controller(&self) -> bool {
         let (base, sub, _pi) = self.class_triple();
         base == 0x0c && sub == 0x03
+    }
+
+    /// Deterministic device classification based solely on the PCI
+    /// class code and the helpers above.
+    pub fn device_class(&self) -> DeviceClass {
+        if self.is_display_controller() {
+            DeviceClass::Gpu
+        } else if self.is_nvme() {
+            DeviceClass::Nvme
+        } else if self.is_network_controller() {
+            DeviceClass::Nic
+        } else if self.is_usb_controller() {
+            DeviceClass::UsbController
+        } else if self.is_storage_controller() {
+            DeviceClass::StorageOther
+        } else {
+            DeviceClass::Other
+        }
     }
 
     /// Phase 4: unbind this device from its current kernel driver, if any.
