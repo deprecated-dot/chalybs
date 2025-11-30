@@ -98,6 +98,15 @@ fn build_gpu_actions(
     for func in gpu_funcs {
         let bdf = func.bdf.as_str();
 
+        // Deterministic sanity check: devices configured under devices.gpu[]
+        // must actually be display controllers (base class 0x03).
+        if !func.is_display_controller() {
+            return Err(ChalybsError::Vfio(format!(
+                "VM {vm_name}: device {bdf} is listed under devices.gpu but PCI class base is \
+                 not 0x03 (display controller)"
+            )));
+        }
+
         let assessment = match by_bdf.get(bdf) {
             Some(a) => *a,
             None => {

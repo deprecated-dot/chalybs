@@ -343,3 +343,9 @@ earlier Markdown. Refer to repository history for exact changes.
 - No unsafe or obsolete code removed.
 
 (Older entries remain below as needed.)
+
+## v1.1.1 — Phase 10A/11 Integration
+- Removed synthetic daemon backend.
+- Introduced real VmStateMachine-driven lifecycle in daemon.
+- Added deterministic per-tick VM bring-up/shutdown.
+- Integrated core events into daemon snapshots.

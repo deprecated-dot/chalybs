@@ -106,7 +106,11 @@ impl VmStateMachine {
                 info!("state=ReserveCpus");
                 self.rt.push_system("state=ReserveCpus");
 
-                crate::cpuset::create_cpuset(&mut self.rt)?;
+                // Phase 10 (CPU): reserve CPUs and create cpuset hierarchy.
+                // This is now routed through the Phase 10 CPU orchestrator
+                // to keep state-machine call sites stable as CPU handling
+                // evolves.
+                crate::cpu::reserve_cpus(&mut self.rt)?;
                 self.rt
                     .push_info("cpuset: VM/host cpuset hierarchy created");
 
@@ -136,7 +140,8 @@ impl VmStateMachine {
                 info!("state=DetectThreads");
                 self.rt.push_system("state=DetectThreads");
 
-                crate::affinity::wait_for_qemu_threads(&self.rt)?;
+                // Phase 10 (CPU): wait for QEMU threads via orchestrator.
+                crate::cpu::wait_for_qemu_threads(&self.rt)?;
                 self.rt
                     .push_info("affinity: QEMU threads discovered for pinning");
 
@@ -147,7 +152,8 @@ impl VmStateMachine {
                 info!("state=PinVcpus");
                 self.rt.push_system("state=PinVcpus");
 
-                crate::affinity::pin_vcpus(&self.rt)?;
+                // Phase 10 (CPU): pin vCPU threads via orchestrator.
+                crate::cpu::pin_vcpus(&self.rt)?;
                 self.rt.pinned_threads = true;
                 self.rt
                     .push_info("affinity: vCPU threads pinned to VM cpuset");
@@ -286,7 +292,8 @@ impl VmStateMachine {
                 info!("state=Cleanup");
                 self.rt.push_system("state=Cleanup");
 
-                crate::cpuset::destroy_cpuset(&mut self.rt)?;
+                // Phase 10 (CPU): cleanup cpuset hierarchy via orchestrator.
+                crate::cpu::cleanup_cpus(&mut self.rt)?;
                 self.rt
                     .push_info("cpuset: VM/host cpuset hierarchy cleaned up");
 
