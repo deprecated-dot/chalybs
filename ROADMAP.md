@@ -161,3 +161,22 @@ reflect what actually shipped and what moved to the next horizon.
 ## Phase 11: Real Daemon/Core Integration — Completed
 - Real VmStateMachine tied into daemon tick.
 - IPC snapshot now reflects live VM states and events.
+
+---
+
+## Added for v1.2.0 — NUMA/RTC/QEMU Determinism Milestone
+
+### ✔ Completed in v1.2.0
+- Introduced TOML-configurable QEMU RTC policy
+- Deterministic NUMA node + hugepage allocation pipeline
+- Config.rs fully reconstructed (no truncation, Deserialize-correct)
+- QEMU argument layers finalized (pre/core/mid/post)
+- NUMA correctness hooks for future hugepage allocator + LG SHM
+
+### 🚧 In Progress (v1.3.0 target)
+- Deterministic VmStateMachine (step + step_shutdown)
+- Hugepage allocator (deterministic node placement)
+- Looking Glass SHM NUMA placement
+- IRQ locality enforcement
+- TUI numactl/pinning inspector
+

@@ -165,9 +165,13 @@ impl VmStateMachine {
                 info!("state=DetectMsi");
                 self.rt.push_system("state=DetectMsi");
 
-                crate::irq::wait_for_msi(&self.rt)?;
-                self.rt
-                    .push_info("irq: MSI vectors detected for passthrough devices");
+                // Phase 11 (IRQ): spawn background worker that will
+                // deterministically hook MSI/MSI-X once the guest driver
+                // brings them up, without blocking VM bring-up here.
+                crate::irq::spawn_irq_pin_worker(&self.rt)?;
+                self.rt.push_info(
+                    "irq: background worker spawned for MSI/MSI-X detection and IRQ pinning",
+                );
 
                 self.state = VmState::PinIrqs;
             }
@@ -176,10 +180,13 @@ impl VmStateMachine {
                 info!("state=PinIrqs");
                 self.rt.push_system("state=PinIrqs");
 
-                crate::irq::pin_irqs(&self.rt)?;
+                // IRQ pinning itself is now handled asynchronously by the
+                // worker started in DetectMsi. From the state machine's
+                // perspective, pinning has been requested and we can
+                // proceed with the remaining bring-up.
                 self.rt.pinned_irqs = true;
                 self.rt
-                    .push_info("irq: IRQ affinities pinned for VM devices");
+                    .push_info("irq: IRQ pinning delegated to background worker");
 
                 self.state = VmState::PeripheralHooks;
             }

@@ -55,13 +55,50 @@ pub struct CpuConfig {
     pub vm_cpus: String,
 }
 
+/// QEMU configuration and CPU/SMBIOS extras.
 #[derive(Debug, Deserialize, Clone)]
 pub struct QemuConfig {
     /// QEMU binary path (e.g. /usr/bin/qemu-system-x86_64)
     pub binary: String,
 
-    /// Extra arguments passed verbatim to QEMU
+    /// Extra arguments injected **before** Chalybs-managed core args.
+    ///
+    /// Example:
+    ///   pre_args = "-name win11-gpu,debug-threads=on -nodefaults"
+    ///
+    /// These are split on whitespace and appended verbatim.
+    #[serde(default)]
+    pub pre_args: Option<String>,
+
+    /// Extra arguments passed verbatim to QEMU (mid-section).
+    ///
+    /// Historically this was the only "args" field; it is preserved
+    /// for backwards compatibility. These are added *after* the core
+    /// Chalybs-managed args, but before `post_args`.
     pub args: String,
+
+    /// Extra arguments injected **after** everything else.
+    ///
+    /// Example:
+    ///   post_args = "-boot menu=on -net none -global kvm-pit.lost_tick_policy=discard"
+    ///
+    /// These are split on whitespace and appended verbatim at the end.
+    #[serde(default)]
+    pub post_args: Option<String>,
+
+    /// Optional RTC policy for QEMU.
+    ///
+    /// If:
+    ///   - `rtc` is **Some(non-empty)**  → emit `-rtc <value>` verbatim.
+    ///   - `rtc` is **Some(empty string)** → emit **no** `-rtc` flag at all
+    ///       (caller accepts QEMU’s default, which is UTC in most builds).
+    ///   - `rtc` is **None** → Chalybs emits:
+    ///       `-rtc base=localtime,driftfix=slew`
+    ///
+    /// This mirrors your legacy Bash suite’s default unless explicitly
+    /// overridden in TOML.
+    #[serde(default)]
+    pub rtc: Option<String>,
 
     /// Number of vCPUs to expose to the guest
     pub num_vcpus: u32,
@@ -77,13 +114,42 @@ pub struct QemuConfig {
 
     /// OVMF VARS image path
     pub ovmf_vars: String,
+
+    /// Optional SMBIOS configuration (type 0/1/2).
+    #[serde(default)]
+    pub smbios: Option<SmbiosConfig>,
+
+    /// Optional CPU model / feature / hypervisor extras.
+    ///
+    /// This is where "ABI / TOPO / HV_CONTEXTS / VENDOR_ID" from the
+    /// legacy Bash suite live.
+    #[serde(default)]
+    pub cpu_extras: Option<CpuExtrasConfig>,
 }
 
 /// NUMA policy (optional)
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct NumaConfig {
-    /// If set, prefer placing vCPUs / IRQs on this NUMA node
+    /// Preferred NUMA node for vCPUs / IRQs.
+    ///
+    /// This is the legacy "NODE=2" semantic from your Bash suite.
+    /// If this is set, Chalybs will:
+    ///   - Bias IRQ pinning to this node
+    ///   - Treat it as the default hugepage node if `hugepage_node`
+    ///     is not explicitly set.
+    #[serde(default)]
     pub node: Option<u16>,
+
+    /// Optional override for hugepage-backed RAM placement.
+    ///
+    /// If set, hugepages for guest RAM are provisioned on this node
+    /// even if CPU/IRQ affinity uses a different node.
+    ///
+    /// If None, we fall back to:
+    ///   - `node` above if set
+    ///   - otherwise, detect the node from the host CPU set.
+    #[serde(default)]
+    pub hugepage_node: Option<u16>,
 }
 
 /// Device configuration: GPU, NVMe, NIC, USB, etc.
@@ -239,6 +305,58 @@ impl Default for IsolationPolicyConfig {
             forbid_host_critical_in_group: default_true(),
         }
     }
+}
+
+/// SMBIOS configuration mapped to QEMU -smbios type 0/1/2.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SmbiosConfig {
+    /// type=0
+    #[serde(default)]
+    pub bios_vendor: Option<String>,
+    #[serde(default)]
+    pub bios_version: Option<String>,
+    #[serde(default)]
+    pub bios_date: Option<String>,
+
+    /// type=1
+    #[serde(default)]
+    pub system_manufacturer: Option<String>,
+    #[serde(default)]
+    pub system_product_name: Option<String>,
+    #[serde(default)]
+    pub system_uuid: Option<String>,
+
+    /// type=2
+    #[serde(default)]
+    pub baseboard_manufacturer: Option<String>,
+    #[serde(default)]
+    pub baseboard_product: Option<String>,
+}
+
+/// CPU model / feature / hypervisor extras for QEMU -cpu.
+///
+/// This is the Rust-side home of the old:
+///   ABI / TOPO / HV_CONTEXTS / VENDOR_ID
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct CpuExtrasConfig {
+    /// CPU model (e.g. "EPYC-v2"). Defaults to "host" if omitted.
+    #[serde(default)]
+    pub abi: Option<String>,
+
+    /// Feature flags appended as-is, e.g.:
+    ///   "pdpe1gb,+hypervisor,+invtsc,+topoext,+kvm"
+    #[serde(default)]
+    pub topo: Option<String>,
+
+    /// Hypervisor contexts, e.g.:
+    ///   "hv-stimer,hv-time,hv-synic,hv-vpindex,hv-avic"
+    #[serde(default)]
+    pub hv_contexts: Option<String>,
+
+    /// Hypervisor vendor id fragment, e.g.:
+    ///   "hv-vendor-id=ASUSTeK"
+    #[serde(default)]
+    pub vendor_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
