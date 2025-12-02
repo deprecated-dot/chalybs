@@ -50,6 +50,7 @@ impl IsolationReport {
 ///   - the resolved PciFunction
 ///   - deterministic DeviceClass classification
 ///   - the effective IsolationLevel for this device
+#[allow(dead_code)]
 struct DeviceIsolationContext<'a> {
     device_cfg: &'a PciDeviceConfig,
     func: &'a PciFunction,
@@ -867,12 +868,16 @@ mod tests {
             },
             qemu: QemuConfig {
                 binary: "/usr/bin/qemu-system-x86_64".to_string(),
+                pre_args: None,
                 args: "".to_string(),
+                post_args: None,
                 num_vcpus: 2,
                 mem_mb: 2048,
                 hugepages: false,
                 ovmf_code: "/usr/share/OVMF/OVMF_CODE.fd".to_string(),
                 ovmf_vars: "/var/lib/libvirt/qemu/nvram/test_VARS.fd".to_string(),
+                smbios: None,
+                cpu_extras: None,
             },
             numa: Some(NumaConfig { node: None }),
             devices: DevicesConfig {
@@ -1028,7 +1033,7 @@ mod tests {
     #[test]
     fn evaluate_isolation_disabled_is_noop_even_with_issues() {
         let gpu_bdf = "0000:02:00.0";
-        let mut cfg = minimal_vm_with_gpu_and_isolation(gpu_bdf, IsolationMode::Disabled);
+        let cfg = minimal_vm_with_gpu_and_isolation(gpu_bdf, IsolationMode::Disabled);
 
         // Inventory with an obvious exclusivity violation.
         let pt_gpu = make_gpu(gpu_bdf, Some("vfio-pci"), Some(3), Some(0));
@@ -1045,7 +1050,7 @@ mod tests {
     #[test]
     fn evaluate_isolation_enforce_errors_on_violation() {
         let gpu_bdf = "0000:03:00.0";
-        let mut cfg = minimal_vm_with_gpu_and_isolation(gpu_bdf, IsolationMode::Enforce);
+        let cfg = minimal_vm_with_gpu_and_isolation(gpu_bdf, IsolationMode::Enforce);
 
         // Same exclusivity violation as previous test, but in Enforce mode.
         let pt_gpu = make_gpu(gpu_bdf, Some("vfio-pci"), Some(4), Some(0));
@@ -1075,12 +1080,16 @@ mod tests {
             },
             qemu: QemuConfig {
                 binary: "/usr/bin/qemu-system-x86_64".to_string(),
+                pre_args: None,
                 args: "".to_string(),
+                post_args: None,
                 num_vcpus: 2,
                 mem_mb: 2048,
                 hugepages: false,
                 ovmf_code: "/usr/share/OVMF/OVMF_CODE.fd".to_string(),
                 ovmf_vars: "/var/lib/libvirt/qemu/nvram/test_VARS.fd".to_string(),
+                smbios: None,
+                cpu_extras: None,
             },
             numa: Some(NumaConfig {
                 node: Some(vm_node),

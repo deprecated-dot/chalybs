@@ -352,3 +352,20 @@ earlier Markdown. Refer to repository history for exact changes.
 - Introduced real VmStateMachine-driven lifecycle in daemon.
 - Added deterministic per-tick VM bring-up/shutdown.
 - Integrated core events into daemon snapshots.
+
+---
+
+## v1.2.0 – 2025-12-01
+
+### Added
+- RTC configuration support in TOML
+- Deterministic NUMA node resolution
+- Full config.rs reconstruction
+- QEMU argument layer architecture
+
+### Changed
+- Improved determinism in RAM placement
+
+### Fixed
+- Deserialize errors
+- Removed stray semicolon

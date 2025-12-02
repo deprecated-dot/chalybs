@@ -4,6 +4,7 @@
 # - New VmConfig layout (cpu/qemu/devices/gpu/isolation/peripherals)
 # - Single-GPU safety policy
 # - Per-VM isolation policy (Phase 8)
+# - Extended QEMU configuration (pre_args/post_args, CPU extras, SMBIOS)
 
 [vm.win11-gpu.cpu]
 # Host CPUs reserved for the VM vCPUs (host CPU IDs).
@@ -13,14 +14,54 @@ host_cpus = "0-7,32-39"
 vm_cpus   = "8-15,40-47"
 
 [vm.win11-gpu.qemu]
-binary   = "/usr/bin/qemu-system-x86_64"
-args     = "-machine type=q35,accel=kvm -display none"
+binary    = "/usr/bin/qemu-system-x86_64"
+
+# Arguments injected BEFORE core Chalybs-managed QEMU args.
+# This is where you can set -name, debug-threads, -nodefaults, etc.
+pre_args  = "-name win11-gpu,debug-threads=on -nodefaults"
+
+# Historical "args" field (kept for existing configs).
+# These are appended after the core args (cpu/machine/memory/firmware).
+args      = "-display none"
+
+# Arguments injected AFTER everything else.
+# Useful for boot menu, net policy, timer policy, etc.
+post_args = "-boot menu=on -net none -global kvm-pit.lost_tick_policy=discard"
+
 num_vcpus = 16
 mem_mb    = 32768
 hugepages = true
 
 ovmf_code = "/usr/share/OVMF/OVMF_CODE.fd"
 ovmf_vars = "/var/lib/chalybs/win11_ovmf_vars.fd"
+
+# Optional: CPU model / hypervisor extras. If omitted, Chalybs uses:
+#   -cpu host
+[vm.win11-gpu.qemu.cpu_extras]
+# QEMU CPU model (e.g. "EPYC-v2"); if unset, defaults to "host".
+abi          = "EPYC-v2"
+
+# Additional feature flags appended as-is.
+topo         = "pdpe1gb,+hypervisor,+invtsc,+topoext,+kvm"
+
+# Hyper-V contexts.
+hv_contexts  = "hv-stimer,hv-time,hv-synic,hv-vpindex,hv-avic"
+
+# Hypervisor vendor id fragment.
+vendor_id    = "hv-vendor-id=ASUSTeK"
+
+# Optional SMBIOS configuration (type 0/1/2).
+[vm.win11-gpu.qemu.smbios]
+bios_vendor           = "AMI"
+bios_version          = "2701"
+bios_date             = "03/14/2024"
+
+system_manufacturer   = "PHI"
+system_product_name   = "SIMULACRUM"
+system_uuid           = "cebd95d1-b040-a276-7367-40b076a27366"
+
+baseboard_manufacturer = "ASUSTeK"
+baseboard_product      = "ZEA"
 
 [vm.win11-gpu.numa]
 # Prefer placing vCPUs / IRQs on this NUMA node.

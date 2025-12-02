@@ -1,8 +1,12 @@
+// core/src/irq/pin.rs
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::{DevicesConfig, PciDeviceConfig, VmConfig};
 use crate::errors::{ChalybsError, Result};
@@ -12,7 +16,12 @@ use crate::util::parse_cpu_list;
 /// Collect all configured PCI devices (gpu, nvme, nic, usb) into a flat list.
 fn collect_devices(cfg: &VmConfig) -> Vec<PciDeviceConfig> {
     let mut out = Vec::new();
-    let DevicesConfig { gpu, nvme, nic, usb } = &cfg.devices;
+    let DevicesConfig {
+        gpu,
+        nvme,
+        nic,
+        usb,
+    } = &cfg.devices;
 
     if let Some(v) = gpu {
         out.extend(v.clone());
@@ -31,7 +40,9 @@ fn collect_devices(cfg: &VmConfig) -> Vec<PciDeviceConfig> {
 }
 
 fn msi_irqs_dir(pci_addr: &str) -> PathBuf {
-    Path::new("/sys/bus/pci/devices").join(pci_addr).join("msi_irqs")
+    Path::new("/sys/bus/pci/devices")
+        .join(pci_addr)
+        .join("msi_irqs")
 }
 
 fn device_numa_node(pci_addr: &str) -> Option<i32> {
@@ -77,13 +88,11 @@ fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
 
 /// Decide which CPUs to use for IRQs of a given device:
 ///   - If the device has a NUMA node (>=0), intersect that node's CPUs
-///     with the VM CPU set (rt.cpus.vm.cpus).
+///     with the VM CPU set.
 ///   - If no NUMA node, use the full VM CPU set.
 ///
 /// This keeps IRQs and vCPUs on the same NUMA node when possible.
-fn target_cpus_for_device(rt: &VmRuntime, dev: &PciDeviceConfig) -> Result<Vec<u32>> {
-    let vm_cpus = &rt.cpus.vm.cpus;
-
+fn target_cpus_for_device(vm_cpus: &[u32], dev: &PciDeviceConfig) -> Result<Vec<u32>> {
     let node = device_numa_node(&dev.pci_address).unwrap_or(-1);
     if node >= 0 {
         let node_cpus = node_cpus(node)?;
@@ -109,10 +118,13 @@ fn target_cpus_for_device(rt: &VmRuntime, dev: &PciDeviceConfig) -> Result<Vec<u
             pci = %dev.pci_address,
             "device has no NUMA node; using full VM CPU set for IRQs"
         );
-        Ok(vm_cpus.clone())
+        Ok(vm_cpus.to_vec())
     }
 }
 
+/// Strict IRQ discovery used by the synchronous path.
+/// This preserves the old semantics: required devices with missing/empty
+/// msi_irqs cause an error.
 fn device_irqs(dev: &PciDeviceConfig) -> Result<Vec<u32>> {
     let dir = msi_irqs_dir(&dev.pci_address);
     if !dir.exists() {
@@ -132,12 +144,15 @@ fn device_irqs(dev: &PciDeviceConfig) -> Result<Vec<u32>> {
     }
 
     let mut irqs = Vec::new();
-    for entry in fs::read_dir(&dir).map_err(|e| {
-        ChalybsError::Irq(format!(
-            "failed to read msi_irqs for {}: {e}",
-            dev.pci_address
-        ))
-    })?.flatten() {
+    for entry in fs::read_dir(&dir)
+        .map_err(|e| {
+            ChalybsError::Irq(format!(
+                "failed to read msi_irqs for {}: {e}",
+                dev.pci_address
+            ))
+        })?
+        .flatten()
+    {
         if let Ok(name) = entry.file_name().into_string() {
             if let Ok(irq) = name.parse::<u32>() {
                 irqs.push(irq);
@@ -155,11 +170,50 @@ fn device_irqs(dev: &PciDeviceConfig) -> Result<Vec<u32>> {
     Ok(irqs)
 }
 
+/// Non-fatal IRQ discovery used by the background worker.
+/// Never returns an error; just an empty vec if nothing is present yet.
+fn device_irqs_best_effort(dev: &PciDeviceConfig) -> Vec<u32> {
+    let dir = msi_irqs_dir(&dev.pci_address);
+    if !dir.exists() {
+        debug!(
+            pci = %dev.pci_address,
+            path = %dir.display(),
+            "msi_irqs directory not present yet"
+        );
+        return Vec::new();
+    }
+
+    let mut irqs = Vec::new();
+    match fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if let Ok(irq) = name.parse::<u32>() {
+                        irqs.push(irq);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            debug!(
+                pci = %dev.pci_address,
+                err = %e,
+                "failed to read msi_irqs directory (best-effort)"
+            );
+        }
+    }
+
+    irqs
+}
+
 fn format_cpu_list(cpus: &[u32]) -> String {
     let mut v = cpus.to_vec();
     v.sort_unstable();
     v.dedup();
-    v.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")
+    v.iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn pin_single_irq(irq: u32, cpus: &[u32]) -> Result<()> {
@@ -201,11 +255,121 @@ fn pin_single_irq(irq: u32, cpus: &[u32]) -> Result<()> {
     Ok(())
 }
 
-/// Public entry point used by VmStateMachine.
+/// Background worker body: best-effort discovery + pinning.
+/// This never blocks VM bring-up and never returns errors to the caller.
+///
+/// Semantics:
+///   - For each device:
+///       * Determine target CPUs (NUMA-aware).
+///       * Poll msi_irqs until IRQs appear or we give up after a
+///         bounded number of attempts.
+///       * When IRQs appear, pin them.
+///   - If IRQs never appear, we log a warning and move on.
+fn irq_worker(vm_cpus: Vec<u32>, devices: Vec<PciDeviceConfig>) {
+    if devices.is_empty() {
+        info!("irq worker: no PCI devices configured; exiting");
+        return;
+    }
+
+    // Polling parameters: light-weight, non-blocking w.r.t. VM lifecycle.
+    const MAX_ITER: u32 = 2000; // 2000 * 5ms = 10 seconds per device
+    const SLEEP_MS: u64 = 5;
+
+    for dev in devices {
+        let target_cpus = match target_cpus_for_device(&vm_cpus, &dev) {
+            Ok(cpus) => cpus,
+            Err(e) => {
+                warn!(
+                    pci = %dev.pci_address,
+                    error = %e,
+                    "irq worker: failed to determine target CPUs for device; skipping"
+                );
+                continue;
+            }
+        };
+
+        let mut irqs: Vec<u32> = Vec::new();
+
+        for attempt in 0..MAX_ITER {
+            irqs = device_irqs_best_effort(&dev);
+            if !irqs.is_empty() {
+                info!(
+                    pci = %dev.pci_address,
+                    ?irqs,
+                    attempts = attempt + 1,
+                    "irq worker: MSI/MSI-X IRQs discovered; pinning"
+                );
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(SLEEP_MS));
+        }
+
+        if irqs.is_empty() {
+            warn!(
+                pci = %dev.pci_address,
+                max_attempts = MAX_ITER,
+                "irq worker: no MSI/MSI-X IRQs discovered; leaving device IRQs unpinned"
+            );
+            continue;
+        }
+
+        let cpu_list_str = format_cpu_list(&target_cpus);
+
+        for irq in irqs {
+            if let Err(e) = pin_single_irq(irq, &target_cpus) {
+                warn!(
+                    pci = %dev.pci_address,
+                    irq,
+                    cpus = %cpu_list_str,
+                    error = %e,
+                    "irq worker: failed to pin IRQ"
+                );
+            }
+        }
+    }
+
+    info!("irq worker: completed IRQ discovery and pinning for all devices");
+}
+
+/// Public entry point used by VmStateMachine for asynchronous IRQ pinning.
+///
+/// This:
+///   - Collects devices from the VM config.
+///   - Clones the VM CPU list from the runtime.
+///   - Spawns a background worker thread that performs best-effort
+///     IRQ discovery and pinning without blocking VM bring-up.
+pub fn spawn_irq_pin_worker(rt: &VmRuntime) -> Result<()> {
+    let devices = collect_devices(&rt.cfg);
+
+    if devices.is_empty() {
+        info!("no PCI devices configured; skipping IRQ pinning worker");
+        return Ok(());
+    }
+
+    let vm_cpus = rt.cpus.vm.cpus.clone();
+
+    info!(
+        device_count = devices.len(),
+        "spawning IRQ pinning worker thread"
+    );
+
+    thread::spawn(move || {
+        irq_worker(vm_cpus, devices);
+    });
+
+    Ok(())
+}
+
+/// Public synchronous entry point (unchanged semantics).
+///
 /// For each configured PCI device:
 ///   - Determine NUMA-local VM CPUs
-///   - Discover MSI/MSI-X IRQs
+///   - Discover MSI/MSI-X IRQs (strictly; required devices must have IRQs)
 ///   - Pin each IRQ to that CPU set
+///
+/// This is useful for manual tools/tests; VmStateMachine should prefer
+/// `spawn_irq_pin_worker` for non-blocking behavior.
 pub fn pin_irqs(rt: &VmRuntime) -> Result<()> {
     let devices = collect_devices(&rt.cfg);
 
@@ -214,8 +378,10 @@ pub fn pin_irqs(rt: &VmRuntime) -> Result<()> {
         return Ok(());
     }
 
+    let vm_cpus = rt.cpus.vm.cpus.clone();
+
     for dev in &devices {
-        let target_cpus = target_cpus_for_device(rt, dev)?;
+        let target_cpus = target_cpus_for_device(&vm_cpus, dev)?;
 
         let irqs = device_irqs(dev)?;
         if irqs.is_empty() {

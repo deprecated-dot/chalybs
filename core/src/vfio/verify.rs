@@ -71,7 +71,8 @@ fn verify_with_inventory(vm_name: &str, cfg: &VmConfig, inv: &PciInventory) -> R
 /// Logical kind of device — used for extra defensive checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceKind {
-    /// A GPU or GPU-like PCI device (class 0x03xxxx).
+    /// A GPU or GPU-like PCI device (class 0x03xxxx), or members of a
+    /// GPU complex (e.g. audio functions sharing a slot with a GPU).
     Gpu,
     /// Generic PCI passthrough device.
     Generic,
@@ -96,7 +97,7 @@ fn verify_device_list(
     let funcs = inv.resolve_configured(cfgs)?;
 
     for func in funcs {
-        verify_single_device(vm_name, kind_label, kind, func)?;
+        verify_single_device(vm_name, kind_label, kind, inv, func)?;
     }
 
     Ok(())
@@ -107,13 +108,14 @@ fn verify_single_device(
     vm_name: &str,
     kind_label: &str,
     kind: Option<DeviceKind>,
+    inv: &PciInventory,
     func: &PciFunction,
 ) -> Result<()> {
     let bdf = func.bdf.as_str();
 
     // Additional defensive checks for GPU entries.
     if let Some(DeviceKind::Gpu) = kind {
-        if !func.is_display_controller() {
+        if !func.is_display_controller() && !inv.is_bdf_in_gpu_complex(bdf) {
             return Err(ChalybsError::Vfio(format!(
                 "VM {vm_name}: device {bdf} configured as GPU, \
                  but PCI class base is not 0x03 (display controller)"
@@ -179,12 +181,16 @@ mod tests {
             },
             qemu: QemuConfig {
                 binary: "/usr/bin/qemu-system-x86_64".to_string(),
+                pre_args: None,
                 args: "".to_string(),
+                post_args: None,
                 num_vcpus: 2,
                 mem_mb: 2048,
                 hugepages: false,
                 ovmf_code: "/usr/share/OVMF/OVMF_CODE.fd".to_string(),
                 ovmf_vars: "/var/lib/libvirt/qemu/nvram/test_VARS.fd".to_string(),
+                smbios: None,
+                cpu_extras: None,
             },
             numa: Some(NumaConfig { node: None }),
             devices: DevicesConfig {

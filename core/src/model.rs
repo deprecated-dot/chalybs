@@ -95,6 +95,18 @@ pub struct VmRuntime {
     /// These events are intended to be deterministic and ordered with
     /// respect to the VM state machine.
     pub events: Vec<CoreEvent>,
+
+    /// Deterministic hugepage backing record.
+    ///
+    /// When `qemu.hugepages = true`, the hugepage provisioning phase
+    /// will:
+    ///   - pick a NUMA node (config / topology)
+    ///   - provision the required number of 2MiB hugepages
+    ///   - record the outcome here for later inspection / TUI display.
+    pub hugepages_node: Option<u16>,
+    pub hugepages_pages: u64,
+    pub hugepages_bytes: u64,
+    pub hugepages_active: bool,
 }
 
 impl VmRuntime {
@@ -109,6 +121,10 @@ impl VmRuntime {
             pinned_irqs: false,
             vfio_transitions: Vec::new(),
             events: Vec::new(),
+            hugepages_node: None,
+            hugepages_pages: 0,
+            hugepages_bytes: 0,
+            hugepages_active: false,
         }
     }
 
