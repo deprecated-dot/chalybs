@@ -3,6 +3,7 @@ pub mod config;
 pub mod cpu;
 pub mod cpuset;
 pub mod errors;
+pub mod hugepages;
 pub mod irq;
 pub mod logging;
 pub mod model;

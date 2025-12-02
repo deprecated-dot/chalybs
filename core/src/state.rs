@@ -7,6 +7,7 @@ use crate::model::VmRuntime;
 pub enum VmState {
     Init,
     Validate,
+    PrepareHugepages,
     PreparePci,
     ReserveCpus,
     LaunchQemu,
@@ -40,8 +41,8 @@ impl VmStateMachine {
 
     /// Advance the VM state machine by at most one state towards `Steady`.
     ///
-    /// This executes a single state's work (e.g. Validate, PreparePci,
-    /// ReserveCpus, ...) and then transitions to the next state.
+    /// This executes a single state's work (e.g. Validate, PrepareHugepages,
+    /// PreparePci, ReserveCpus, ...) and then transitions to the next state.
     ///
     /// Returns the new state after this step.
     ///
@@ -78,6 +79,32 @@ impl VmStateMachine {
                 crate::config::pci::preflight_gpu_policy(&self.rt.name, &self.rt.cfg)?;
                 self.rt
                     .push_info("pci: GPU policy preflight completed successfully");
+
+                // First writey phase: hugepage provisioning.
+                // This is intentionally placed before any VFIO or cpuset
+                // mutations so that hugepage failures fail-fast without
+                // leaving partially staged devices or cpusets behind.
+                self.state = VmState::PrepareHugepages;
+            }
+
+            VmState::PrepareHugepages => {
+                info!("state=PrepareHugepages");
+                self.rt.push_system("state=PrepareHugepages");
+
+                // Phase 12: deterministic hugepage provisioning.
+                //
+                // Behavior:
+                //   - If qemu.hugepages = false → no-op (logs and returns Ok).
+                //   - Otherwise:
+                //       * pick NUMA node (config / topology)
+                //       * compute required 2MiB pages from mem_mb
+                //       * write node-local nr_hugepages
+                //       * record outcome in VmRuntime.{hugepages_*}
+                //
+                // Semantics mirror the existing Bash suite; no QEMU CLI
+                // changes are made here. QEMU flags remain under operator
+                // control via vm.qemu.args/post_args.
+                crate::hugepages::provision_for_vm(&mut self.rt)?;
 
                 self.state = VmState::PreparePci;
             }
@@ -281,7 +308,7 @@ impl VmStateMachine {
                     .push_info("qemu: shutdown requested for VM instance");
 
                 // After requesting shutdown, we model the next step as
-                // Cleanup, which will perform PCI restore + cpuset cleanup.
+                // Shutdown (restore PCI + cpuset cleanup in next arm).
                 self.state = VmState::Shutdown;
             }
 

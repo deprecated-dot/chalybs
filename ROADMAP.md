@@ -180,3 +180,8 @@ reflect what actually shipped and what moved to the next horizon.
 - IRQ locality enforcement
 - TUI numactl/pinning inspector
 
+### v1.2.1 checkpoint (2025-12-02)
+
+- **Segmented VmStateMachine** is now in-tree (`step`, `run_until_steady`, `step_shutdown`, `run_shutdown`), covering validation, hugepages, PCI/VFIO staging, CPU reservation, QEMU launch, IRQ worker spawn, and peripheral hooks.
+- **VM-scoped lifecycle events** (`CoreEvent*` on `VmRuntime`) are plumbed through to the daemon/TUI for the events rail and F2 VM detail modal.
+- **IRQ locality workstream** has its first concrete piece: an asynchronous MSI/MSI-X worker with NUMA-aware CPU selection and config-only aux-GPU detection. Further refinements remain under the existing IRQ locality + TUI inspector workstreams.
