@@ -17,6 +17,42 @@ v1.1.1 replaces the synthetic TUI backend with real VM lifecycle orchestration a
 
 ---
 
+## v1.2.1 – Segmented VM lifecycle & IRQ worker
+
+**Status:** local-only / not yet packaged
+
+This minor release tightens the VM lifecycle story around two pillars:
+
+1. A segmented, daemon-friendly `VmStateMachine` that can advance bring-up and shutdown one step at a time.
+2. A deterministic IRQ worker that pins MSI/MSI-X interrupts once the guest has brought them up, without blocking QEMU launch.
+
+### Highlights
+
+- **Segmented VM lifecycle**
+  - `VmStateMachine` now exposes `step` / `run_until_steady` for bring-up, and `step_shutdown` / `run_shutdown` for teardown.
+  - New states make the pipeline explicit: validation, hugepage provisioning, PCI/VFIO staging, CPU reservation, QEMU launch, IRQ detection, peripheral hooks, and steady-state entry.
+  - Daemon/TUI can drive the machine one tick at a time while observing ordered events.
+
+- **VM-scoped lifecycle events**
+  - `CoreEventKind` and `CoreEvent` attach a small, serialization-friendly event rail to `VmRuntime`.
+  - Convenience helpers (`push_info`, `push_warning`, `push_error`, `push_system`) record major milestones and semantic warnings.
+  - The TUI consumes these events for the central “Events” rail and the F2 VM detail modal.
+
+- **Asynchronous IRQ pinning worker**
+  - Background worker spawned from the `DetectMsi` state watches `/sys/bus/pci/.../msi_irqs` while QEMU is alive.
+  - IRQs are pinned to NUMA-local VM CPUs when possible, sharing the same CPU selection logic as the strict synchronous path.
+  - GPU HDMI/audio “aux” functions are identified purely from configured GPU BDFs and treated as best-effort for missing IRQs (INFO instead of WARN).
+
+- **TUI quality-of-life**
+  - VM list badges and the F2 info modal surface CPU pinning, IRQ pinning, hugepages enabled/disabled, and isolation mode (`disabled`/`audit`/`enforce`).
+  - These indicators are driven from runtime state rather than static config, keeping the UI aligned with what the core actually did.
+
+### Upgrade notes
+
+- Existing configurations continue to work; the segmented state machine wraps the prior monolithic bring-up/shutdown behavior.
+- The strict IRQ pinning helper (`pin_irqs`) is unchanged in semantics and remains suitable for test tooling.
+- For normal operation, the daemon/TUI should prefer the asynchronous worker via the state machine (`DetectMsi` / `PinIrqs` states).
+
 ## v1.1.0 – PNG Logo + Halo Pipeline (Experimental) & Process Hardening
 
 ### Highlights

@@ -6,6 +6,32 @@
 
 ---
 
+## v1.2.1 – VM state machine & IRQ worker
+
+**Status:** local-only / not yet packaged
+
+**Added**
+
+- Segmented `VmStateMachine` bring-up and shutdown pipeline:
+  - `step` / `run_until_steady` for forward progress towards Steady.
+  - `step_shutdown` / `run_shutdown` for deterministic teardown to Idle.
+  - Explicit states for hugepage provisioning, PCI/VFIO staging, CPU reservation, QEMU launch, IRQ detection, and peripheral hooks.
+- VM-scoped lifecycle event rail:
+  - `CoreEventKind`, `CoreEvent`, and `VmRuntime::push_*` helpers.
+  - Used to emit ordered lifecycle milestones (cpuset preflight, PCI staging, QEMU launch, IRQ worker spawn, shutdown cleanup, etc.).
+- Asynchronous IRQ pinning worker in `core::irq::pin`:
+  - `spawn_irq_pin_worker` and an internal `irq_worker` loop that polls for MSI/MSI-X IRQs while QEMU is alive.
+  - NUMA-aware CPU selection shared with the synchronous `pin_irqs` path.
+  - Config-only heuristic to treat GPU HDMI/audio “aux” functions as best-effort for missing IRQs.
+
+**Changed**
+
+- IRQ pinning semantics:
+  - Synchronous `pin_irqs` keeps strict behavior for required devices (missing IRQs still fail bring-up).
+  - Background worker pins IRQs without blocking bring-up and logs per-device completion plus a final summary line once all devices are handled.
+- TUI integration:
+  - VM list badges and the F2 VM detail modal now reflect CPU pinning, IRQ pinning, hugepage enablement, and isolation mode (`disabled`/`audit`/`enforce`) derived from runtime state.
+
 ## v1.1.0 – PNG Logo & Halo Pipeline (Experimental)
 
 **Status:** local-only / not yet packaged

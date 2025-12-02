@@ -3,9 +3,8 @@
 use std::fs;
 use std::path::Path;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-use crate::config::NumaConfig;
 use crate::errors::{ChalybsError, Result};
 use crate::model::VmRuntime;
 use crate::util::parse_cpu_list;
@@ -21,6 +20,8 @@ use crate::util::parse_cpu_list;
 ///
 /// In your current config, this will resolve to node=2 and **must not
 /// be changed** unless you explicitly change the TOML.
+///
+/// This helper is read-only and does not modify sysfs.
 fn select_hugepage_node(rt: &VmRuntime) -> Result<u16> {
     // 1/2: explicit NUMA configuration.
     if let Some(ncfg) = &rt.cfg.numa {
@@ -36,8 +37,8 @@ fn select_hugepage_node(rt: &VmRuntime) -> Result<u16> {
 
     // 3: derive from host CPU topology.
     let host_cpus = parse_cpu_list(rt.cfg.cpu.host_cpus.trim()).map_err(|e| {
-        ChalybsError::Cpu(format!(
-            "failed to parse host CPU list '{}' for hugepage NUMA detection: {e}",
+        ChalybsError::Other(format!(
+            "hugepages: failed to parse host CPU list '{}' for NUMA detection: {e}",
             rt.cfg.cpu.host_cpus
         ))
     })?;
@@ -47,8 +48,8 @@ fn select_hugepage_node(rt: &VmRuntime) -> Result<u16> {
     let mut best_overlap = 0usize;
 
     for entry in fs::read_dir(node_root).map_err(|e| {
-        ChalybsError::Cpu(format!(
-            "failed to list NUMA nodes in {}: {e}",
+        ChalybsError::Other(format!(
+            "hugepages: failed to list NUMA nodes in {}: {e}",
             node_root.display()
         ))
     })? {
@@ -109,29 +110,40 @@ fn select_hugepage_node(rt: &VmRuntime) -> Result<u16> {
         );
         Ok(node)
     } else {
-        Err(ChalybsError::Cpu(
-            "failed to determine NUMA node for hugepages (no overlap between host CPUs and NUMA nodes)"
+        Err(ChalybsError::Other(
+            "hugepages: failed to determine NUMA node (no overlap between host CPUs and NUMA nodes)"
                 .into(),
         ))
     }
 }
 
-/// Provision hugepages for the VM's RAM on a specific NUMA node.
+/// Hugepage bring-up semantics (Phase 12, read-only):
 ///
-/// - If qemu.hugepages = false → no-op.
-/// - Otherwise:
+/// - If qemu.hugepages = false → no-op (logs and returns Ok).
+/// - If qemu.hugepages = true:
 ///     * pick node (config/topology)
-///     * compute required 2MiB pages
-///     * write /sys/devices/system/node/nodeX/hugepages/hugepages-2048kB/nr_hugepages
-///     * record the outcome in VmRuntime
+///     * compute required 2MiB pages from mem_mb
+///     * read node-local nr_hugepages and free_hugepages
+///     * **verify** that the node has at least `pages` total and free
+///       hugepages available
+///     * record the expectation in VmRuntime.{hugepages_*}
+///
+/// This function **never writes to sysfs**. Any shortfall is treated as
+/// a deterministic, blocking error **before** VFIO / cpuset staging.
+/// QEMU CLI remains under operator control via vm.qemu.args/post_args.
 pub fn provision_for_vm(rt: &mut VmRuntime) -> Result<()> {
     let q = &rt.cfg.qemu;
 
     if !q.hugepages {
         info!(
             vm = %rt.name,
-            "hugepages: disabled in config; skipping hugepage provisioning"
+            "hugepages: disabled in config; skipping hugepage verification"
         );
+        // Leave rt.hugepages_* at their defaults; hugepages are not active.
+        rt.hugepages_active = false;
+        rt.hugepages_node = None;
+        rt.hugepages_pages = 0;
+        rt.hugepages_bytes = 0;
         return Ok(());
     }
 
@@ -144,53 +156,67 @@ pub fn provision_for_vm(rt: &mut VmRuntime) -> Result<()> {
     let mem_bytes = q.mem_mb * 1024 * 1024;
     let pages = (mem_bytes + hugepage_size_bytes - 1) / hugepage_size_bytes;
 
-    let hp_path = Path::new("/sys/devices/system/node")
+    let node_dir = Path::new("/sys/devices/system/node")
         .join(format!("node{node}"))
         .join("hugepages")
-        .join("hugepages-2048kB")
-        .join("nr_hugepages");
+        .join("hugepages-2048kB");
 
-    let current: u64 = fs::read_to_string(&hp_path)
-        .map_err(|e| {
-            ChalybsError::Cpu(format!(
-                "hugepages: failed to read {}: {e}",
-                hp_path.display()
-            ))
-        })?
-        .trim()
-        .parse()
-        .map_err(|e| {
-            ChalybsError::Cpu(format!(
-                "hugepages: failed to parse current hugepage count from {}: {e}",
-                hp_path.display()
+    let nr_path = node_dir.join("nr_hugepages");
+    let free_path = node_dir.join("free_hugepages");
+
+    let read_u64 = |path: &Path, label: &str| -> Result<u64> {
+        let raw = fs::read_to_string(path).map_err(|e| {
+            ChalybsError::Other(format!(
+                "hugepages: failed to read {} from {}: {e}",
+                label,
+                path.display()
             ))
         })?;
-
-    if current != pages {
-        info!(
-            vm = %rt.name,
-            node,
-            current,
-            target = pages,
-            path = %hp_path.display(),
-            "hugepages: adjusting node-local hugepage count"
-        );
-
-        fs::write(&hp_path, pages.to_string()).map_err(|e| {
-            ChalybsError::Cpu(format!(
-                "hugepages: failed to write {}: {e}",
-                hp_path.display()
+        raw.trim().parse::<u64>().map_err(|e| {
+            ChalybsError::Other(format!(
+                "hugepages: failed to parse {} from {}: {e}",
+                label,
+                path.display()
             ))
-        })?;
-    } else {
-        info!(
-            vm = %rt.name,
-            node,
-            pages,
-            "hugepages: node already has required hugepage count"
-        );
+        })
+    };
+
+    let nr_total = read_u64(&nr_path, "nr_hugepages")?;
+    let free_pages = read_u64(&free_path, "free_hugepages")?;
+
+    info!(
+        vm = %rt.name,
+        node,
+        required_pages = pages,
+        nr_hugepages = nr_total,
+        free_hugepages = free_pages,
+        "hugepages: verification of node-local 2MiB hugepages"
+    );
+
+    // Deterministic failure conditions:
+    //
+    // 1) Node does not have enough total hugepages provisioned.
+    if nr_total < pages {
+        return Err(ChalybsError::Other(format!(
+            "hugepages: insufficient 2MiB hugepages provisioned on NUMA node {node}: \
+             required {pages}, current {nr_total} (nr_hugepages). \
+             Increase node-local hugepage pool and retry."
+        )));
     }
 
+    // 2) Node has enough total, but not enough free hugepages.
+    if free_pages < pages {
+        return Err(ChalybsError::Other(format!(
+            "hugepages: NUMA node {node} has {nr_total} total 2MiB hugepages but only \
+             {free_pages} free; VM {} requires {pages} free hugepages for {} MiB of RAM. \
+             Stop other hugepage users or increase provisioning and retry.",
+            rt.name, q.mem_mb
+        )));
+    }
+
+    // At this point, we have at least `pages` free 2MiB hugepages on the
+    // selected node. We do **not** touch sysfs; we only record the
+    // expectation in the runtime for introspection and logging.
     let total_bytes = pages * hugepage_size_bytes;
 
     rt.hugepages_node = Some(node);
@@ -199,10 +225,12 @@ pub fn provision_for_vm(rt: &mut VmRuntime) -> Result<()> {
     rt.hugepages_active = true;
 
     rt.push_info(format!(
-        "hugepages: provisioned {} x 2MiB pages ({:.1} GiB) on NUMA node {}",
+        "hugepages: verified availability of {} x 2MiB pages ({:.1} GiB) on NUMA node {} \
+         for VM {}",
         pages,
         total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        node
+        node,
+        rt.name
     ));
 
     Ok(())
