@@ -23,6 +23,7 @@ use chalybs_core::model::{CoreEventKind, CpuSet, VmCpuLayout, VmRuntime};
 use chalybs_core::pci::{PciFunction, PciInventory};
 use chalybs_core::state::{VmState, VmStateMachine};
 use chalybs_core::util::parse_cpu_list;
+use tracing::{info, warn};
 
 /// A single VM managed by the daemon.
 ///
@@ -94,11 +95,6 @@ pub struct DaemonState {
 
 impl DaemonState {
     /// Construct daemon state from config + PCI inventory.
-    ///
-    /// This preserves the original Phase 3A behavior for config/PCI
-    /// introspection (startup events), while adding a new VM registry
-    /// for real core state machines. VM runtimes are created lazily
-    /// when `vm start` is requested, not eagerly at startup.
     pub fn new() -> Self {
         // Load config (unchanged semantics).
         let (root_cfg, mut startup_events_global) = load_root_config();
@@ -152,7 +148,7 @@ impl DaemonState {
 
         startup_events_global.extend(pci_events);
 
-        // Per-VM startup introspection (unchanged semantics).
+        // Per-VM startup introspection.
         let mut startup_events_vm = Vec::new();
         if let Some(ref cfg) = root_cfg {
             if let Some(inv) = &pci_inventory {
@@ -187,13 +183,7 @@ impl DaemonState {
         }
     }
 
-    /// Advance all managed VMs one deterministic tick towards their
-    /// desired state and build a snapshot for the TUI.
-    ///
-    /// This replaces the old synthetic backend. Snapshots now reflect:
-    ///   - real VmStateMachine states (Init → Steady → Idle)
-    ///   - real VM-scoped events from VmRuntime.events
-    ///   - real cpuset / IRQ pinning flags from VmRuntime
+    /// Advance all managed VMs one deterministic tick.
     pub fn build_snapshot(
         &mut self,
         tick: u64,
@@ -202,15 +192,11 @@ impl DaemonState {
         let mut events_global = Vec::new();
         let mut events_vm = Vec::new();
 
-        // Inject startup events on tick == 1 (unchanged semantics).
         if tick == 1 {
             events_global.extend(self.startup_events_global.clone());
             events_vm.extend(self.startup_events_vm.clone());
         }
 
-        // Build VM status for all VMs defined in config (sorted by name
-        // for deterministic ordering), regardless of whether they have
-        // an active state machine yet.
         if let Some(ref cfg) = self.root_cfg {
             let mut names: Vec<&String> = cfg.vm.keys().collect();
             names.sort();
@@ -219,37 +205,77 @@ impl DaemonState {
                 let name_str = name.as_str();
                 let vm_cfg = &cfg.vm[name_str];
 
-                // If we have an active DaemonVm, drive its state machine
-                // one step towards the desired state.
-                let (view_state, cpu_pinned, irq_pinned, tasmota_on) =
-                    if let Some(dvm) = self.vms.get_mut(name_str) {
-                        drive_vm_towards_desired(dvm);
+                let (view_state, cpu_pinned, irq_pinned, tasmota_on) = if let Some(dvm) =
+                    self.vms.get_mut(name_str)
+                {
+                    // Deterministic guest-initiated shutdown detection:
+                    //
+                    // If QEMU has exited (e.g. Windows Server shutdown from inside
+                    // the guest), we observe the child status here and:
+                    //
+                    //   - Drop the QEMU handle from the runtime so the core
+                    //     shutdown path does *not* attempt another SIGTERM.
+                    //   - Set `desired` to Stopped so the daemon/core state
+                    //     machine walks the normal Shutdown → Cleanup → Idle path.
+                    //
+                    // This keeps the TUI/daemon view in sync with reality and
+                    // still routes cleanup through the core state machine.
+                    if dvm.sm.state == VmState::Steady {
+                        if let Some(ref mut qstate) = dvm.sm.rt.qemu {
+                            match qstate.child.try_wait() {
+                                Ok(Some(status)) => {
+                                    info!(
+                                            vm = name_str,
+                                            pid = qstate.pid,
+                                            ?status,
+                                            "daemon: detected QEMU process exit (guest-initiated shutdown)"
+                                        );
+                                    // Drop the QEMU handle so qemu::shutdown() is a no-op.
+                                    dvm.sm.rt.qemu = None;
+                                    // Ask the core to walk the shutdown path on the next tick.
+                                    dvm.desired = IpcVmState::Stopped;
+                                }
+                                Ok(None) => {
+                                    // Still running; nothing to do.
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        vm = name_str,
+                                        pid = qstate.pid,
+                                        error = %e,
+                                        "daemon: failed to poll QEMU child process status"
+                                    );
+                                }
+                            }
+                        }
+                    }
 
-                        let view_state = map_vm_state_to_ipc(dvm.sm.state);
-                        let cpu_pinned = dvm.sm.rt.pinned_threads;
-                        let irq_pinned = dvm.sm.rt.pinned_irqs;
+                    // Drive state machine toward desired state (bring-up or shutdown).
+                    drive_vm_towards_desired(dvm);
 
-                        let tasmota_on = dvm
-                            .sm
-                            .rt
-                            .cfg
-                            .peripherals
-                            .as_ref()
-                            .and_then(|p| p.tasmota.as_ref())
-                            .is_some();
+                    let view_state = map_vm_state_to_ipc(dvm.sm.state);
+                    let cpu_pinned = dvm.sm.rt.pinned_threads;
+                    let irq_pinned = dvm.sm.rt.pinned_irqs;
 
-                        (view_state, cpu_pinned, irq_pinned, tasmota_on)
-                    } else {
-                        // No active runtime yet; treat as stopped and
-                        // rely purely on config for static fields.
-                        let tasmota_on = vm_cfg
-                            .peripherals
-                            .as_ref()
-                            .and_then(|p| p.tasmota.as_ref())
-                            .is_some();
+                    let tasmota_on = dvm
+                        .sm
+                        .rt
+                        .cfg
+                        .peripherals
+                        .as_ref()
+                        .and_then(|p| p.tasmota.as_ref())
+                        .is_some();
 
-                        (IpcVmState::Stopped, false, false, tasmota_on)
-                    };
+                    (view_state, cpu_pinned, irq_pinned, tasmota_on)
+                } else {
+                    let tasmota_on = vm_cfg
+                        .peripherals
+                        .as_ref()
+                        .and_then(|p| p.tasmota.as_ref())
+                        .is_some();
+
+                    (IpcVmState::Stopped, false, false, tasmota_on)
+                };
 
                 let isolation_mode = match vm_cfg.isolation.mode {
                     IsolationMode::Disabled => "disabled",
@@ -272,7 +298,6 @@ impl DaemonState {
             }
         }
 
-        // Daemon heartbeat at fixed interval (unchanged).
         if tick % 40 == 0 {
             events_global.push(IpcEvent {
                 kind: IpcEventKind::Info,
@@ -280,7 +305,6 @@ impl DaemonState {
             });
         }
 
-        // Append VM-scoped core events incrementally for each active VM.
         for (name, dvm) in self.vms.iter_mut() {
             if dvm.sm.rt.events.len() <= dvm.last_sent_event_index {
                 continue;
@@ -317,19 +341,13 @@ impl DaemonState {
     }
 }
 
-/// Drive a VM one step towards its desired high-level state.
-///
-/// This is intentionally conservative:
-///   - Starting/Running ⇒ bring-up via step() from valid bring-up
-///     states (Init → Steady).
-///   - Stopped/ShuttingDown ⇒ shutdown via step_shutdown() until Idle.
-///   - Any state machine error is recorded as a VM-scoped error event
-///     and the desired state is forced to Stopped to avoid tight loops.
+/// Drive a VM one step toward its desired state.
 fn drive_vm_towards_desired(vm: &mut DaemonVm) {
     match vm.desired {
         IpcVmState::Running | IpcVmState::Starting => match vm.sm.state {
             VmState::Init
             | VmState::Validate
+            | VmState::PrepareHugepages
             | VmState::PreparePci
             | VmState::ReserveCpus
             | VmState::LaunchQemu
@@ -346,20 +364,21 @@ fn drive_vm_towards_desired(vm: &mut DaemonVm) {
                 }
             }
             VmState::Steady => {
-                // Reached steady-state; normalize desired to Running.
                 vm.desired = IpcVmState::Running;
             }
-            VmState::Shutdown | VmState::Cleanup | VmState::Idle => {
-                // Currently shutting down or fully Idle; do not attempt
-                // to re-enter bring-up implicitly. The operator should
-                // issue another `vm start` to reinitialize.
+            VmState::Shutdown | VmState::Cleanup => {
+                // Already on the shutdown path; nothing to do here for a
+                // "keep running" desire until the state machine returns to Idle.
+            }
+            VmState::Idle => {
+                // Idle + desire=Running will be handled on the next tick as
+                // the caller transitions desired to Running and step() begins
+                // a fresh bring-up sequence.
             }
         },
 
         IpcVmState::Stopped | IpcVmState::ShuttingDown => match vm.sm.state {
-            VmState::Idle => {
-                // Fully shut down; nothing more to do.
-            }
+            VmState::Idle => {}
             _ => {
                 if let Err(e) = vm.sm.step_shutdown() {
                     vm.sm
@@ -371,11 +390,12 @@ fn drive_vm_towards_desired(vm: &mut DaemonVm) {
     }
 }
 
-/// Map core VmState into a coarse IPC-visible VmState.
+/// Map core VmState into coarse IPC state.
 pub fn map_vm_state_to_ipc(state: VmState) -> IpcVmState {
     match state {
         VmState::Init
         | VmState::Validate
+        | VmState::PrepareHugepages
         | VmState::PreparePci
         | VmState::ReserveCpus
         | VmState::LaunchQemu
@@ -390,10 +410,9 @@ pub fn map_vm_state_to_ipc(state: VmState) -> IpcVmState {
     }
 }
 
-// ----- Helpers from original server.rs (config + PCI introspection) --------
+// ----- Helpers from original server.rs -------------------------------------
 
 fn load_root_config() -> (Option<RootConfig>, Vec<IpcEvent>) {
-    // COPIED EXACTLY from original server.rs
     use std::path::Path;
     const DEFAULT_CONFIG_PATH: &str = "/etc/chalybs/chalybs.toml";
 
@@ -464,7 +483,6 @@ fn load_root_config() -> (Option<RootConfig>, Vec<IpcEvent>) {
 }
 
 fn introspect_vm_config_only(vm_name: &str, vm: &VmConfig) -> Vec<IpcEvent> {
-    // COPIED EXACTLY from original server.rs
     let mut events = Vec::new();
 
     match parse_cpu_list(vm.cpu.vm_cpus.as_str()) {

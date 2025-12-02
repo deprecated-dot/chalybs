@@ -255,81 +255,259 @@ fn pin_single_irq(irq: u32, cpus: &[u32]) -> Result<()> {
     Ok(())
 }
 
-/// Background worker body: best-effort discovery + pinning.
-/// This never blocks VM bring-up and never returns errors to the caller.
+/// Check if a process with the given PID appears to exist.
 ///
-/// Semantics:
-///   - For each device:
-///       * Determine target CPUs (NUMA-aware).
-///       * Poll msi_irqs until IRQs appear or we give up after a
-///         bounded number of attempts.
-///       * When IRQs appear, pin them.
-///   - If IRQs never appear, we log a warning and move on.
-fn irq_worker(vm_cpus: Vec<u32>, devices: Vec<PciDeviceConfig>) {
+/// This is used as the *only* stop condition for the IRQ worker
+/// besides successfully discovering MSI/MSI-X IRQs. There is no
+/// heuristic timeout; as long as QEMU is alive, we keep polling
+/// deterministically for IRQs.
+fn process_exists(pid: i32) -> bool {
+    let path = Path::new("/proc").join(pid.to_string());
+    path.exists()
+}
+
+/// Parse "0000:bb:dd.f" into ("0000:bb:dd", func).
+///
+/// We treat the function number as decimal (0–7), matching kernel BDF
+/// formatting. Returns None on malformed BDFs.
+fn parse_bdf_slot_and_func(bdf: &str) -> Option<(String, u8)> {
+    // Expected form: "dddd:bb:dd.f"
+    let mut parts = bdf.split(':');
+    let domain_str = parts.next()?;
+    let bus_str = parts.next()?;
+    let devfunc_str = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let mut devfunc_parts = devfunc_str.split('.');
+    let dev_str = devfunc_parts.next()?;
+    let func_str = devfunc_parts.next()?;
+    if devfunc_parts.next().is_some() {
+        return None;
+    }
+
+    // Enforce widths for the slot portion; func can be 0–7 with no padding.
+    if domain_str.len() != 4 || bus_str.len() != 2 || dev_str.len() != 2 || func_str.is_empty() {
+        return None;
+    }
+
+    // Domain/bus/dev are hex; function is decimal.
+    let domain = u16::from_str_radix(domain_str, 16).ok()?;
+    let bus = u8::from_str_radix(bus_str, 16).ok()?;
+    let dev = u8::from_str_radix(dev_str, 16).ok()?;
+    let func = func_str.parse::<u8>().ok()?;
+
+    Some((format!("{domain:04x}:{bus:02x}:{dev:02x}"), func))
+}
+
+/// Determine if a configured PCI device looks like an "auxiliary GPU
+/// function" (typically HDMI/audio) for IRQ pinning purposes.
+///
+/// Heuristic, but *config-only* and deterministic:
+///   - Consider only devices configured under `devices.gpu`.
+///   - Group configured GPU BDFs by (domain,bus,slot).
+///   - If a slot has multiple functions and function 0 is present,
+///     then any non-zero function in that slot is treated as auxiliary.
+///
+/// This lets us special-case GPU HDMI/audio functions without touching
+/// global PCI inventory and without guessing based on class codes here.
+fn is_aux_gpu_function(dev: &PciDeviceConfig, cfg: &VmConfig) -> bool {
+    let (slot, func) = match parse_bdf_slot_and_func(&dev.pci_address) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    let gpu_cfgs = match cfg.devices.gpu.as_ref() {
+        Some(v) if !v.is_empty() => v,
+        _ => return false,
+    };
+
+    let mut same_slot_count = 0usize;
+    let mut has_func0 = false;
+
+    for g in gpu_cfgs {
+        if let Some((g_slot, g_func)) = parse_bdf_slot_and_func(&g.pci_address) {
+            if g_slot == slot {
+                same_slot_count += 1;
+                if g_func == 0 {
+                    has_func0 = true;
+                }
+            }
+        }
+    }
+
+    // Only treat as aux if:
+    //   - there is more than one GPU function configured for this slot, and
+    //   - function 0 is present, and
+    //   - this device is a non-zero function in that slot.
+    same_slot_count > 1 && has_func0 && func != 0
+}
+
+/// Internal per-device state used by the IRQ worker.
+struct DeviceWork {
+    dev: PciDeviceConfig,
+    target_cpus: Vec<u32>,
+    is_aux_gpu: bool,
+    done: bool,
+}
+
+/// Background worker body: best-effort discovery + pinning.
+///
+/// Deterministic semantics:
+///   - Precompute target CPUs + aux-GPU classification for all devices.
+///   - While QEMU exists:
+///       * Scan all not-yet-done devices:
+///           - If MSI/MSI-X IRQs appear, pin them and mark device done.
+///       * If no device made progress on this pass, sleep briefly.
+///   - If QEMU exits before all devices are done:
+///       * For primary devices → WARN and leave IRQs unpinned.
+///       * For auxiliary GPU functions (.1 HDMI/audio) → INFO and leave as expected.
+///
+/// There is **no max-attempt cap**. The only reasons this worker stops are:
+///   - QEMU has exited, or
+///   - MSI/MSI-X IRQs were successfully discovered and pinned for all
+///     configured devices for which we could compute target CPUs.
+fn irq_worker(vm_cpus: Vec<u32>, devices: Vec<PciDeviceConfig>, qemu_pid: i32, vm_cfg: VmConfig) {
     if devices.is_empty() {
         info!("irq worker: no PCI devices configured; exiting");
         return;
     }
 
-    // Polling parameters: light-weight, non-blocking w.r.t. VM lifecycle.
-    const MAX_ITER: u32 = 2000; // 2000 * 5ms = 10 seconds per device
     const SLEEP_MS: u64 = 5;
 
+    // Precompute per-device work state.
+    let mut work_items: Vec<DeviceWork> = Vec::new();
+
     for dev in devices {
-        let target_cpus = match target_cpus_for_device(&vm_cpus, &dev) {
-            Ok(cpus) => cpus,
+        // *** Minimal change: skip auxiliary GPU functions entirely ***
+        let is_aux = is_aux_gpu_function(&dev, &vm_cfg);
+        if is_aux {
+            info!(
+                pci = %dev.pci_address,
+                "irq worker: treating device as auxiliary GPU function (likely HDMI/audio); \
+                 skipping IRQ pinning for this device"
+            );
+            continue;
+        }
+
+        match target_cpus_for_device(&vm_cpus, &dev) {
+            Ok(cpus) => {
+                work_items.push(DeviceWork {
+                    dev,
+                    target_cpus: cpus,
+                    is_aux_gpu: false,
+                    done: false,
+                });
+            }
             Err(e) => {
                 warn!(
                     pci = %dev.pci_address,
                     error = %e,
                     "irq worker: failed to determine target CPUs for device; skipping"
                 );
-                continue;
-            }
-        };
-
-        let mut irqs: Vec<u32> = Vec::new();
-
-        for attempt in 0..MAX_ITER {
-            irqs = device_irqs_best_effort(&dev);
-            if !irqs.is_empty() {
-                info!(
-                    pci = %dev.pci_address,
-                    ?irqs,
-                    attempts = attempt + 1,
-                    "irq worker: MSI/MSI-X IRQs discovered; pinning"
-                );
-                break;
-            }
-
-            thread::sleep(Duration::from_millis(SLEEP_MS));
-        }
-
-        if irqs.is_empty() {
-            warn!(
-                pci = %dev.pci_address,
-                max_attempts = MAX_ITER,
-                "irq worker: no MSI/MSI-X IRQs discovered; leaving device IRQs unpinned"
-            );
-            continue;
-        }
-
-        let cpu_list_str = format_cpu_list(&target_cpus);
-
-        for irq in irqs {
-            if let Err(e) = pin_single_irq(irq, &target_cpus) {
-                warn!(
-                    pci = %dev.pci_address,
-                    irq,
-                    cpus = %cpu_list_str,
-                    error = %e,
-                    "irq worker: failed to pin IRQ"
-                );
             }
         }
     }
 
-    info!("irq worker: completed IRQ discovery and pinning for all devices");
+    if work_items.is_empty() {
+        info!("irq worker: no eligible PCI devices after CPU/heuristic filtering; exiting");
+        return;
+    }
+
+    let total_devices = work_items.len();
+    let mut completed_devices: usize = 0;
+    let mut aborted_early = false;
+
+    while completed_devices < total_devices {
+        // If QEMU is gone, stop polling and emit per-device summaries.
+        if !process_exists(qemu_pid) {
+            aborted_early = true;
+
+            for w in work_items.iter().filter(|w| !w.done) {
+                if w.is_aux_gpu {
+                    info!(
+                        pci = %w.dev.pci_address,
+                        pid = qemu_pid,
+                        "irq worker: QEMU process exited before MSI/MSI-X IRQs were discovered \
+                         for auxiliary GPU function; leaving device IRQs unpinned (expected for HDMI/audio)"
+                    );
+                } else {
+                    warn!(
+                        pci = %w.dev.pci_address,
+                        pid = qemu_pid,
+                        "irq worker: QEMU process exited before MSI/MSI-X IRQs were discovered; \
+                         leaving device IRQs unpinned"
+                    );
+                }
+            }
+
+            break;
+        }
+
+        let mut made_progress = false;
+
+        for w in work_items.iter_mut().filter(|w| !w.done) {
+            let irqs = device_irqs_best_effort(&w.dev);
+            if irqs.is_empty() {
+                continue;
+            }
+
+            made_progress = true;
+
+            if w.is_aux_gpu {
+                info!(
+                    pci = %w.dev.pci_address,
+                    ?irqs,
+                    "irq worker: MSI/MSI-X IRQs discovered for auxiliary GPU function; pinning"
+                );
+            } else {
+                info!(
+                    pci = %w.dev.pci_address,
+                    ?irqs,
+                    "irq worker: MSI/MSI-X IRQs discovered; pinning"
+                );
+            }
+
+            let cpu_list_str = format_cpu_list(&w.target_cpus);
+
+            for irq in irqs {
+                if let Err(e) = pin_single_irq(irq, &w.target_cpus) {
+                    warn!(
+                        pci = %w.dev.pci_address,
+                        irq,
+                        cpus = %cpu_list_str,
+                        error = %e,
+                        "irq worker: failed to pin IRQ"
+                    );
+                }
+            }
+
+            w.done = true;
+            completed_devices += 1;
+        }
+
+        if completed_devices >= total_devices {
+            break;
+        }
+
+        if !made_progress {
+            thread::sleep(Duration::from_millis(SLEEP_MS));
+        }
+    }
+
+    if aborted_early {
+        warn!(
+            completed = completed_devices,
+            total = total_devices,
+            "irq worker: exiting before all devices were processed (QEMU exited early)"
+        );
+    } else {
+        info!(
+            device_count = total_devices,
+            "irq worker: completed IRQ discovery and pinning for all devices"
+        );
+    }
 }
 
 /// Public entry point used by VmStateMachine for asynchronous IRQ pinning.
@@ -337,8 +515,18 @@ fn irq_worker(vm_cpus: Vec<u32>, devices: Vec<PciDeviceConfig>) {
 /// This:
 ///   - Collects devices from the VM config.
 ///   - Clones the VM CPU list from the runtime.
+///   - Captures the QEMU pid from the runtime.
+///   - Clones the VmConfig for auxiliary GPU classification.
 ///   - Spawns a background worker thread that performs best-effort
 ///     IRQ discovery and pinning without blocking VM bring-up.
+///
+/// Semantics:
+///   - As long as QEMU is alive, the worker will continue polling for
+///     MSI/MSI-X IRQs; there is no heuristic timeout.
+///   - Auxiliary GPU functions (.1 HDMI/audio) are classified from
+///     config; missing MSI/MSI-X on those devices is logged as INFO,
+///     not WARNING, and is treated as expected.
+///   - If QEMU exits before IRQs appear, the worker stops.
 pub fn spawn_irq_pin_worker(rt: &VmRuntime) -> Result<()> {
     let devices = collect_devices(&rt.cfg);
 
@@ -348,14 +536,24 @@ pub fn spawn_irq_pin_worker(rt: &VmRuntime) -> Result<()> {
     }
 
     let vm_cpus = rt.cpus.vm.cpus.clone();
+    let vm_cfg = rt.cfg.clone();
+
+    let qemu_pid = match rt.qemu {
+        Some(ref q) => q.pid,
+        None => {
+            warn!("spawn_irq_pin_worker: no QEMU process recorded in runtime; skipping IRQ pinning worker");
+            return Ok(());
+        }
+    };
 
     info!(
         device_count = devices.len(),
+        pid = qemu_pid,
         "spawning IRQ pinning worker thread"
     );
 
     thread::spawn(move || {
-        irq_worker(vm_cpus, devices);
+        irq_worker(vm_cpus, devices, qemu_pid, vm_cfg);
     });
 
     Ok(())
