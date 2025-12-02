@@ -256,3 +256,22 @@ Warnings exist but are strictly cosmetic (unused struct fields from mock data).
 - PCI/IRQ/NUMA heatmap visualization  
 - Rich pop-out modals  
 - Optional kitty-graphics rendering of the Chalybs logo  
+
+---
+
+## v1.2.0 — Deterministic NUMA, RTC, and QEMU Lifecycle Expansion
+
+### New Features
+- TOML-configurable RTC policy
+- NUMA node + hugepage node deterministic resolution
+- Full config.rs restoration and correctness
+- Clean QEMU argument production ordering
+
+### Improvements
+- Re-established Bash suite parity on RTC and NUMA behavior
+- Better determinism guarantees for RAM placement
+
+### Fixes
+- Removed stray semicolon in QemuConfig
+- Fixed Deserialize failures
+- Ensured full-file synchronization correctness

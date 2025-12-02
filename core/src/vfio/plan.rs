@@ -70,6 +70,15 @@ pub fn build_plan_for_vm(vm_name: &str, cfg: &VmConfig, inv: &PciInventory) -> R
 /// - Safe   → allowed.
 /// - Risky  → hard-error.
 /// - Unsafe → hard-error.
+///
+/// Under Option B GPU-complex semantics:
+/// - Functions that are *display controllers* (class base 0x03) follow
+///   the existing GPU unbind safety logic.
+/// - Functions listed under devices.gpu that are *not* display
+///   controllers are accepted if they share a slot with a display
+///   controller (GPU complex members, e.g. audio). These are staged
+///   like generic PCI devices and do not require a GPU unbind
+///   assessment of their own.
 fn build_gpu_actions(
     vm_name: &str,
     cfg: &VmConfig,
@@ -88,7 +97,7 @@ fn build_gpu_actions(
 
     let gpu_funcs = inv.resolve_configured(gpu_cfgs)?;
 
-    // Build BDF → assessment map.
+    // Build BDF → assessment map for GPU *display* functions.
     let assessments = inv.assess_gpu_unbind_safety();
     let mut by_bdf: HashMap<&str, &GpuUnbindAssessment> = HashMap::new();
     for a in &assessments {
@@ -98,36 +107,47 @@ fn build_gpu_actions(
     for func in gpu_funcs {
         let bdf = func.bdf.as_str();
 
-        // Deterministic sanity check: devices configured under devices.gpu[]
-        // must actually be display controllers (base class 0x03).
-        if !func.is_display_controller() {
-            return Err(ChalybsError::Vfio(format!(
-                "VM {vm_name}: device {bdf} is listed under devices.gpu but PCI class base is \
-                 not 0x03 (display controller)"
-            )));
-        }
+        if func.is_display_controller() {
+            // Original semantics for true GPU functions.
+            let assessment = match by_bdf.get(bdf) {
+                Some(a) => *a,
+                None => {
+                    return Err(ChalybsError::Vfio(format!(
+                        "VM {vm_name}: no GPU unbind assessment available for {bdf}"
+                    )));
+                }
+            };
 
-        let assessment = match by_bdf.get(bdf) {
-            Some(a) => *a,
-            None => {
-                return Err(ChalybsError::Vfio(format!(
-                    "VM {vm_name}: no GPU unbind assessment available for {bdf}"
-                )));
+            match &assessment.feasibility {
+                GpuUnbindFeasibility::Safe => {
+                    append_actions_for_function(vm_name, "GPU", func, unbind_actions, bind_actions);
+                }
+                GpuUnbindFeasibility::Risky(msg) => {
+                    return Err(ChalybsError::Vfio(format!(
+                        "VM {vm_name}: GPU {bdf} is classified as RISKY to unbind: {msg}"
+                    )));
+                }
+                GpuUnbindFeasibility::Unsafe(msg) => {
+                    return Err(ChalybsError::Vfio(format!(
+                        "VM {vm_name}: GPU {bdf} is classified as UNSAFE to unbind: {msg}"
+                    )));
+                }
             }
-        };
-
-        match &assessment.feasibility {
-            GpuUnbindFeasibility::Safe => {
+        } else {
+            // Non-display function listed under devices.gpu — e.g. GPU audio.
+            //
+            // Option B + A2/B1 semantics:
+            // - We *allow* these entries as long as they are members of a
+            //   GPU complex (same slot as a display controller).
+            // - We treat them like generic PCI devices with respect to
+            //   unbind/bind; we do not require a separate GPU unbind
+            //   safety assessment keyed on their BDF.
+            if inv.is_bdf_in_gpu_complex(bdf) {
                 append_actions_for_function(vm_name, "GPU", func, unbind_actions, bind_actions);
-            }
-            GpuUnbindFeasibility::Risky(msg) => {
+            } else {
                 return Err(ChalybsError::Vfio(format!(
-                    "VM {vm_name}: GPU {bdf} is classified as RISKY to unbind: {msg}"
-                )));
-            }
-            GpuUnbindFeasibility::Unsafe(msg) => {
-                return Err(ChalybsError::Vfio(format!(
-                    "VM {vm_name}: GPU {bdf} is classified as UNSAFE to unbind: {msg}"
+                    "VM {vm_name}: device {bdf} is listed under devices.gpu but PCI class base is \
+                     not 0x03 (display controller) and it does not share a PCI slot with a display controller"
                 )));
             }
         }
@@ -246,12 +266,16 @@ mod tests {
             },
             qemu: QemuConfig {
                 binary: "/usr/bin/qemu-system-x86_64".to_string(),
+                pre_args: None,
                 args: "".to_string(),
+                post_args: None,
                 num_vcpus: 2,
                 mem_mb: 2048,
                 hugepages: false,
                 ovmf_code: "/usr/share/OVMF/OVMF_CODE.fd".to_string(),
                 ovmf_vars: "/var/lib/libvirt/qemu/nvram/test_VARS.fd".to_string(),
+                smbios: None,
+                cpu_extras: None,
             },
             numa: Some(NumaConfig { node: None }),
             devices: DevicesConfig {

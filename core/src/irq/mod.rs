@@ -1,5 +1,5 @@
-mod discover;
+// core/src/irq/mod.rs
+
 mod pin;
 
-pub use discover::wait_for_msi;
-pub use pin::pin_irqs;
+pub use pin::{pin_irqs, spawn_irq_pin_worker};

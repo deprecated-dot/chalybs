@@ -146,6 +146,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                         app.select_next_vm();
                     }
 
+                    // VM lifecycle controls (updated to Ctrl+U/O/I).
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.start_selected_vm(&mut backend);
+                    }
+                    KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.stop_selected_vm(&mut backend);
+                    }
+                    KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.restart_selected_vm(&mut backend);
+                    }
+
                     // Events scroll via PgUp/PgDn; implies lock.
                     KeyCode::PageUp => {
                         app.lock_events_scroll();

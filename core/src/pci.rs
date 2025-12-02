@@ -218,6 +218,13 @@ impl PciFunction {
         }
     }
 
+    /// Return the (domain,bus,slot) triple parsed from the BDF.
+    ///
+    /// This ignores the function number and returns None on malformed BDFs.
+    pub fn slot_key(&self) -> Option<(u16, u8, u8)> {
+        parse_bdf_slot(&self.bdf)
+    }
+
     /// Phase 4: unbind this device from its current kernel driver, if any.
     ///
     /// This uses the classic sysfs interface:
@@ -233,6 +240,17 @@ impl PciFunction {
                 return Ok(());
             }
         };
+
+        // Option A semantics:
+        // If this function is already bound to vfio-pci, we treat it as
+        // operator-assigned for passthrough and never attempt to unbind it.
+        if driver_name == "vfio-pci" {
+            debug!(
+                bdf = self.bdf.as_str(),
+                "PCI function bound to vfio-pci; skipping unbind per Option A semantics"
+            );
+            return Ok(());
+        }
 
         let driver_unbind_path = Path::new("/sys/bus/pci/drivers")
             .join(driver_name)
@@ -556,6 +574,26 @@ impl PciInventory {
         Ok(out)
     }
 
+    /// Return true if the given BDF appears to be part of a "GPU complex"
+    /// at the slot level: at least one function in the same
+    /// (domain,bus,slot) triple is a display controller.
+    pub fn is_bdf_in_gpu_complex(&self, bdf: &str) -> bool {
+        let key = match parse_bdf_slot(bdf) {
+            Some(k) => k,
+            None => return false,
+        };
+
+        for func in &self.functions {
+            if let Some(fkey) = func.slot_key() {
+                if fkey == key && func.is_display_controller() {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Phase 3: simulate unbind safety for each GPU discovered in the
     /// inventory (read-only, no sysfs writes).
     pub fn assess_gpu_unbind_safety(&self) -> Vec<GpuUnbindAssessment> {
@@ -566,25 +604,37 @@ impl PciInventory {
             let safety = gpu.gpu_safety_class().unwrap_or(GpuSafetyClass::Unknown);
             let group_id = gpu.iommu_group;
 
+            // Collect group member BDFs (excluding this GPU) for logging.
             let mut member_bdfs: Vec<String> = Vec::new();
-            let feasibility = match group_id {
-                None => GpuUnbindFeasibility::Unsafe(
-                    "GPU has no IOMMU group; cannot safely isolate for passthrough".to_string(),
-                ),
-                Some(gid) => match groups.get(&gid) {
-                    None => GpuUnbindFeasibility::Risky(
-                        "IOMMU group not found in inventory; treating as risky".to_string(),
-                    ),
-                    Some(members) => {
-                        for m in members {
-                            if m.bdf != gpu.bdf {
-                                member_bdfs.push(m.bdf.clone());
-                            }
+            if let Some(gid) = group_id {
+                if let Some(members) = groups.get(&gid) {
+                    for m in members {
+                        if m.bdf != gpu.bdf {
+                            member_bdfs.push(m.bdf.clone());
                         }
-
-                        evaluate_gpu_unbind_feasibility(gpu, &safety, members)
                     }
-                },
+                }
+            }
+
+            // Option A semantics:
+            // If this GPU is already bound to vfio-pci, we treat it as
+            // operator-assigned for passthrough and do *not* attempt any
+            // unbind safety heuristics. From Chalybs' point of view this
+            // is categorically safe.
+            let feasibility = if matches!(gpu.driver.as_deref(), Some("vfio-pci")) {
+                GpuUnbindFeasibility::Safe
+            } else {
+                match group_id {
+                    None => GpuUnbindFeasibility::Unsafe(
+                        "GPU has no IOMMU group; cannot safely isolate for passthrough".to_string(),
+                    ),
+                    Some(gid) => match groups.get(&gid) {
+                        None => GpuUnbindFeasibility::Risky(
+                            "IOMMU group not found in inventory; treating as risky".to_string(),
+                        ),
+                        Some(members) => evaluate_gpu_unbind_feasibility(gpu, &safety, members),
+                    },
+                }
             };
 
             out.push(GpuUnbindAssessment {
@@ -603,6 +653,10 @@ impl PciInventory {
 
 /// Decide how safe it looks to unbind `gpu`, given its safety class and
 /// all devices in its IOMMU group.
+///
+/// NOTE: vfio-pci–bound GPUs are handled earlier in
+/// `assess_gpu_unbind_safety()` and never reach this function under
+/// Option A semantics.
 fn evaluate_gpu_unbind_feasibility(
     gpu: &PciFunction,
     safety: &GpuSafetyClass,
@@ -727,6 +781,37 @@ fn read_numa_node(dir: &Path) -> Option<i32> {
     s.parse::<i32>().ok()
 }
 
+/// Parse a BDF string "0000:bb:dd.f" into a (domain,bus,slot) key.
+/// Returns None if the BDF is malformed.
+fn parse_bdf_slot(bdf: &str) -> Option<(u16, u8, u8)> {
+    // Expected form: "dddd:bb:dd.f"
+    let mut parts = bdf.split(':');
+    let domain_str = parts.next()?;
+    let bus_str = parts.next()?;
+    let devfunc_str = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let mut devfunc_parts = devfunc_str.split('.');
+    let dev_str = devfunc_parts.next()?;
+    let func_str = devfunc_parts.next()?;
+    if devfunc_parts.next().is_some() {
+        return None;
+    }
+
+    // Enforce strict widths to avoid accepting malformed BDFs like "00:01:23.1".
+    if domain_str.len() != 4 || bus_str.len() != 2 || dev_str.len() != 2 || func_str.is_empty() {
+        return None;
+    }
+
+    let domain = u16::from_str_radix(domain_str, 16).ok()?;
+    let bus = u8::from_str_radix(bus_str, 16).ok()?;
+    let dev = u8::from_str_radix(dev_str, 16).ok()?;
+
+    Some((domain, bus, dev))
+}
+
 /// Request Linux to rescan the PCI bus.
 ///
 /// This is typically only needed after hot-plug operations or when we
@@ -838,9 +923,10 @@ mod tests {
     }
 
     #[test]
-    fn gpu_unbind_assessment_simple_safe() {
-        // Single vfio GPU in its own IOMMU group.
-        let gpu = make_gpu(Some("vfio-pci"), Some(10));
+    fn gpu_unbind_assessment_vfio_without_iommu_group_is_safe() {
+        // vfio-pci bound GPU with no IOMMU group is treated as Safe,
+        // because we never intend to unbind it (Option A semantics).
+        let gpu = make_gpu(Some("vfio-pci"), None);
 
         let inv = PciInventory {
             functions: vec![gpu],
@@ -850,14 +936,13 @@ mod tests {
         assert_eq!(assessments.len(), 1);
         let a = &assessments[0];
 
-        assert_eq!(a.iommu_group, Some(10));
-        assert!(a.group_members.is_empty());
         assert!(matches!(a.feasibility, GpuUnbindFeasibility::Safe));
     }
 
     #[test]
-    fn gpu_unbind_assessment_no_iommu_group_is_unsafe() {
-        let gpu = make_gpu(Some("vfio-pci"), None);
+    fn gpu_unbind_assessment_non_vfio_no_iommu_group_is_unsafe() {
+        // Non-vfio GPU with no IOMMU group remains Unsafe.
+        let gpu = make_gpu(Some("nvidia"), None);
 
         let inv = PciInventory {
             functions: vec![gpu],
@@ -875,5 +960,36 @@ mod tests {
         let gpu = make_gpu(Some("vfio-pci"), Some(1));
         // This must not touch /sys because we early-return.
         gpu.bind_to_vfio_pci().unwrap();
+    }
+
+    #[test]
+    fn is_bdf_in_gpu_complex_identifies_slot_mates() {
+        let gpu = PciFunction {
+            bdf: "0000:4a:00.0".to_string(),
+            vendor_id: 0x1234,
+            device_id: 0x5678,
+            class: 0x030000, // display controller
+            driver: Some("nvidia".to_string()),
+            iommu_group: Some(1),
+            numa_node: Some(0),
+        };
+
+        let audio = PciFunction {
+            bdf: "0000:4a:00.1".to_string(),
+            vendor_id: 0x1234,
+            device_id: 0x8765,
+            class: 0x040300, // typical HDA audio
+            driver: Some("snd_hda_intel".to_string()),
+            iommu_group: Some(1),
+            numa_node: Some(0),
+        };
+
+        let inv = PciInventory {
+            functions: vec![gpu, audio],
+        };
+
+        assert!(inv.is_bdf_in_gpu_complex("0000:4a:00.0"));
+        assert!(inv.is_bdf_in_gpu_complex("0000:4a:00.1"));
+        assert!(!inv.is_bdf_in_gpu_complex("0000:4a:00.2"));
     }
 }

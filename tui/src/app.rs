@@ -975,6 +975,66 @@ impl App {
     pub fn selected_vm(&self) -> Option<&VmStatus> {
         self.vms.get(self.selected_vm)
     }
+
+    /// Request a start for the currently selected VM via the backend.
+    ///
+    /// This emits a daemon-supported lifecycle command of the form:
+    ///
+    ///     vm start <name>
+    ///
+    /// The command is sent directly to the backend and any resulting
+    /// events from the backend/daemon are pushed into the event stream.
+    /// Shell history and shell input are not modified.
+    pub fn start_selected_vm<B: ChalybsBackend>(&mut self, backend: &mut B) {
+        let vm = match self.selected_vm() {
+            Some(vm) => vm,
+            None => return,
+        };
+
+        let cmd = format!("vm start {}", vm.name);
+        let events = backend.handle_shell_command(&cmd);
+        self.push_events(events);
+    }
+
+    /// Request a stop for the currently selected VM via the backend.
+    ///
+    /// This emits a daemon-supported lifecycle command of the form:
+    ///
+    ///     vm stop <name>
+    ///
+    /// The command is sent directly to the backend and any resulting
+    /// events from the backend/daemon are pushed into the event stream.
+    /// Shell history and shell input are not modified.
+    pub fn stop_selected_vm<B: ChalybsBackend>(&mut self, backend: &mut B) {
+        let vm = match self.selected_vm() {
+            Some(vm) => vm,
+            None => return,
+        };
+
+        let cmd = format!("vm stop {}", vm.name);
+        let events = backend.handle_shell_command(&cmd);
+        self.push_events(events);
+    }
+
+    /// Request a restart for the currently selected VM via the backend.
+    ///
+    /// This emits a daemon-supported lifecycle command of the form:
+    ///
+    ///     vm restart <name>
+    ///
+    /// The command is sent directly to the backend and any resulting
+    /// events from the backend/daemon are pushed into the event stream.
+    /// Shell history and shell input are not modified.
+    pub fn restart_selected_vm<B: ChalybsBackend>(&mut self, backend: &mut B) {
+        let vm = match self.selected_vm() {
+            Some(vm) => vm,
+            None => return,
+        };
+
+        let cmd = format!("vm restart {}", vm.name);
+        let events = backend.handle_shell_command(&cmd);
+        self.push_events(events);
+    }
 }
 
 /// Helper to construct the App + MockBackend pair.
