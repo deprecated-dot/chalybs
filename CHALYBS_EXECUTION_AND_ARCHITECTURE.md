@@ -373,3 +373,78 @@ Panel borders (VMs, Events, Shell, and the VM detail modal) use
 The result is a low-level sense of life in the panels—closer to RF noise on a
 lab bench than a blinking "NO VACANCY" sign.
 
+
+
+---
+
+## 10. v1.2.2 Implementation Notes (VFIO, Hugepages, IRQ worker, Tasmota)
+
+This section records how the v1.2.2 work maps onto the phase model without rewriting
+the earlier narrative sections.
+
+### 10.1 PCI / VFIO lifecycle
+
+- **Staging behaviour**
+  - During `PreparePci`, any device that is already bound to `vfio-pci` is treated as
+    a dedicated passthrough device for the VM.
+  - These devices are logged as "already vfio-bound at staging time" and **no restore
+    transition is recorded** for them. In other words, the system treats them as
+    "always-vfio" from the host’s perspective.
+- **Isolation logging**
+  - Phase 2 remains detection-only for host-owned GPUs bound to host graphics drivers;
+    they are classified as `HostOwned`, and we emit warnings without touching their
+    drivers.
+  - Phase 8/9 isolation logs explicitly distinguish:
+    - IOMMU groups that are fully exclusive to the VM
+      (`IOMMU_GROUP_EXCLUSIVE_PASSTHROUGH`), and
+    - host-only groups that contain host-owned GPUs but no passthrough devices
+      (`HOST_CRITICAL_GPU_SHARED_GROUP_HOST_ONLY`), where the impact is about host
+      availability and performance, not safety of passthrough.
+- **Shutdown**
+  - The PCI restore phase walks the recorded transition list; when there are no
+    transitions (e.g. all devices were already vfio-bound), we emit a summary log
+    showing total/restored/failed device counts and perform a no-op.
+
+### 10.2 Stateful hugepages manager
+
+- `PrepareHugepages` now manages hugepages as a **stateful resource**:
+  - Mount a Chalybs-managed `hugetlbfs` at `/dev/hugepages`.
+  - Request a pagecache drop and memory compaction.
+  - Raise `nr_hugepages` on the configured NUMA node to satisfy the VM’s
+    page-backed-RAM requirements.
+  - Log the before/after state (required pages, `nr_hugepages`, `free_hugepages`) so
+    failures are diagnosable.
+- On shutdown (`step_shutdown`):
+  - Reset node-local `nr_hugepages` back to zero.
+  - Reset the global `/proc/sys/vm/nr_hugepages` back to zero.
+  - Request another pagecache drop + compaction.
+  - Unmount `/dev/hugepages` so the host returns to a clean baseline after the VM
+    exits.
+
+### 10.3 IRQ worker without a wait timer
+
+- Phase 8 (`DetectMsi`) launches the IRQ worker thread with the full set of devices
+  that should have their MSI/MSI-X IRQs pinned to the VM cpuset.
+- The old "wait timer" that tried to guess when the guest would finish PCI
+  enumeration has been removed. Instead:
+  - The worker loops until it can see MSI/MSI-X entries for a given device, then
+    pins them immediately to the NUMA-local VM CPUs.
+  - There are no arbitrary sleeps in this path; any delay is tied to real discovery
+    work.
+- Auxiliary GPU audio functions are explicitly treated as low-value from an IRQ
+  optimisation perspective: the worker logs that it is skipping them and leaves them
+  on the VM cpuset via the device group.
+
+### 10.4 PeripheralHooks + Tasmota
+
+- The `PeripheralHooks` state now encapsulates smart power control via Tasmota:
+  - On VM start (transition into "up"), Chalybs publishes `POWER ON` to the configured
+    MQTT topic.
+  - On VM stop (guest-initiated shutdown or orchestrated stop), Chalybs publishes
+    `POWER OFF`.
+- Both transitions are logged with:
+  - broker address,
+  - topic, and
+  - payload,
+  so failures can be correlated with specific lifecycle phases.
+

@@ -185,7 +185,9 @@ fn restore_impl(rt: &VmRuntime, mode: RestoreMode) -> Result<RestoreSummary> {
     if rt.vfio_transitions.is_empty() {
         info!(
             vm = rt.name.as_str(),
-            "vfio: no recorded VFIO transitions; skipping PCI restore"
+            "vfio: no recorded driver transitions for this VM; \
+             skipping PCI restore (all passthrough devices were already vfio-bound \
+             at staging time or required no driver changes)"
         );
         return Ok(summary);
     }

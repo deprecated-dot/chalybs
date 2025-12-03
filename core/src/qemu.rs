@@ -269,8 +269,26 @@ pub fn launch(rt: &mut VmRuntime) -> Result<()> {
         .arg("-smp")
         .arg(q.num_vcpus.to_string())
         .arg("-m")
-        .arg(q.mem_mb.to_string())
-        .arg("-machine")
+        .arg(q.mem_mb.to_string());
+
+    // If hugepages are active for this VM, direct QEMU to allocate
+    // RAM from the hugetlbfs mount that Phase 12 provisioned.
+    // This is the only behavior change here: we do not alter mem_mb,
+    // topology, or device wiring.
+    if rt.hugepages_active {
+        info!(
+            vm = %rt.name,
+            node = ?rt.hugepages_node,
+            pages = rt.hugepages_pages,
+            bytes = rt.hugepages_bytes,
+            "qemu: using hugepages-backed RAM via hugetlbfs"
+        );
+        cmd.arg("-mem-prealloc")
+            .arg("-mem-path")
+            .arg("/dev/hugepages");
+    }
+
+    cmd.arg("-machine")
         .arg("q35,accel=kvm")
         .arg("-drive")
         .arg(format!(

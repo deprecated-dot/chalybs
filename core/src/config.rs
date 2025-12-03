@@ -368,9 +368,26 @@ pub struct PeripheralConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TasmotaConfig {
-    pub url: String,
-    pub on_command: String,
-    pub off_command: String,
+    /// MQTT broker, e.g. "mqtt://homeassistant.local.arpa:1883"
+    pub mqtt_host: String,
+
+    /// Optional username for broker authentication.
+    #[serde(default)]
+    pub username: Option<String>,
+
+    /// Optional password for broker authentication.
+    #[serde(default)]
+    pub password: Option<String>,
+
+    /// Tasmota device id used in FullTopic.
+    ///
+    /// Topic is derived deterministically as:
+    ///   "cmnd/<device_id>/POWER"
+    ///
+    /// Payload is:
+    ///   "ON"  on vm_up
+    ///   "OFF" on vm_down
+    pub device_id: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -378,6 +395,11 @@ pub struct DdcConfig {
     pub monitor_i2c_bus: u8,
     pub vm_input: u8,
     pub host_input: u8,
+
+    /// If true, DDC errors are treated as fatal VM errors. If false,
+    /// they are logged as warnings and ignored.
+    #[serde(default)]
+    pub fatal_on_error: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -464,6 +486,11 @@ pub mod pci {
 
         // Phase 3: unbind safety simulation (still read-only, no sysfs writes).
         let unbind_assessments = inv.assess_gpu_unbind_safety();
+        let mut by_bdf: HashMap<&str, &GpuUnbindAssessment> = HashMap::new();
+        for a in &unbind_assessments {
+            by_bdf.insert(a.bdf.as_str(), a);
+        }
+
         for a in &unbind_assessments {
             let group_members_str = if a.group_members.is_empty() {
                 "<none>".to_string()

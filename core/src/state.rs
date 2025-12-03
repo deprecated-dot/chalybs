@@ -331,6 +331,16 @@ impl VmStateMachine {
                 self.rt
                     .push_info("cpuset: VM/host cpuset hierarchy cleaned up");
 
+                // Phase 12: hugepage teardown (best-effort).
+                crate::hugepages::cleanup_for_vm(&mut self.rt)?;
+                self.rt
+                    .push_info("hugepages: teardown completed for VM instance");
+
+                // Phase 14: peripheral VM-down hooks (Tasmota, etc.)
+                crate::peripherals::apply_vm_down(&self.rt)?;
+                self.rt
+                    .push_info("peripherals: VM down hooks applied successfully");
+
                 self.state = VmState::Cleanup;
             }
 
