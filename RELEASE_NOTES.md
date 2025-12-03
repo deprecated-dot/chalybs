@@ -1,3 +1,54 @@
+# Chalybs v1.2.2 Release Notes
+
+This release tightens the PCI/VFIO lifecycle for dedicated passthrough devices, makes
+the hugepages story explicitly stateful and self-cleaning, and wires the VM lifecycle
+into a Tasmota-backed smart power switch. It also removes the last of the timing
+heuristics from the IRQ pinning path in favour of a deterministic worker.
+
+## Highlights
+
+- **"Always-vfio" semantics for dedicated passthrough devices**
+  - Devices that are already bound to `vfio-pci` at staging time are now treated as
+    dedicated passthrough for that VM. We no longer pretend they have a restore
+    transition at shutdown; instead we log that they were vfio-bound up front and
+    leave them alone on restore.
+  - The shutdown PCI restore phase now reports a clear summary (total/restored/failed)
+    and fast-paths the no-op case when there were no driver transitions to begin with.
+
+- **Clearer GPU isolation and host safety signals**
+  - Phase 2 (preflight) remains detection-only for host-owned GPUs bound to host
+    graphics drivers. We log them as `HostOwned` and issue warnings without taking
+    action.
+  - Phase 8/9 isolation logs explicitly distinguish between:
+    - host-only groups that contain host-owned GPUs but no passthrough devices, and
+    - IOMMU groups that are fully exclusive to the VM
+      (`IOMMU_GROUP_EXCLUSIVE_PASSTHROUGH`).
+
+- **Stateful hugepages manager**
+  - `PrepareHugepages` now mounts a Chalybs-managed `hugetlbfs` at `/dev/hugepages`,
+    performs a pagecache drop + compaction, and raises `nr_hugepages` on the configured
+    NUMA node just-in-time for the VM.
+  - On shutdown we reset both node-local and global hugepage counts back to zero,
+    request another pagecache drop + compaction, and unmount `/dev/hugepages` so the
+    host returns to a clean baseline.
+
+- **Deterministic IRQ worker (no wait timer)**
+  - The IRQ worker still launches at `DetectMsi`, but the old "wait timer" heuristic
+    has been removed. We rely on the worker to discover MSI/MSI-X lines and pin them
+    directly to the NUMA-local VM cpuset without arbitrary sleeps.
+  - Auxiliary GPU audio functions are treated as low-value from an IRQ pinning
+    perspective; they are left as-is on the VM cpuset via group membership but we do
+    not attempt per-IRQ optimisation.
+
+- **PeripheralHooks + Tasmota**
+  - The `PeripheralHooks` phase is now wired into a Tasmota MQTT integration for smart
+    power control around the VM lifecycle.
+  - When the VM comes up, Chalybs publishes `POWER ON` to the configured topic; when the
+    VM shuts down, it publishes `POWER OFF`. Both transitions are logged with broker,
+    topic, and payload to make correlation with hypervisor events trivial.
+
+---
+
 # Chalybs v1.1.1 Release Notes
 
 ## Overview

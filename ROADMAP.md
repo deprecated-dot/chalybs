@@ -185,3 +185,11 @@ reflect what actually shipped and what moved to the next horizon.
 - **Segmented VmStateMachine** is now in-tree (`step`, `run_until_steady`, `step_shutdown`, `run_shutdown`), covering validation, hugepages, PCI/VFIO staging, CPU reservation, QEMU launch, IRQ worker spawn, and peripheral hooks.
 - **VM-scoped lifecycle events** (`CoreEvent*` on `VmRuntime`) are plumbed through to the daemon/TUI for the events rail and F2 VM detail modal.
 - **IRQ locality workstream** has its first concrete piece: an asynchronous MSI/MSI-X worker with NUMA-aware CPU selection and config-only aux-GPU detection. Further refinements remain under the existing IRQ locality + TUI inspector workstreams.
+
+
+v1.2.2 checkpoint (2025-12-03)
+
+- **VFIO dedicated passthrough restore semantics** is now wired through the VFIO staging and `RestorePci` phases. Devices that are already bound to `vfio-pci` at staging time are treated as dedicated passthrough and are excluded from driver transition bookkeeping; shutdown leaves them alone instead of trying to guess a host driver.
+- **RestorePci summary reporting** now produces explicit per-VM summaries in both dry-run and live modes, including the “no recorded transitions” case, so you can see at a glance whether PCI restore actually touched anything for a VM.
+- **Host-critical GPU host-only warnings** extend the VFIO isolation checker: host-only IOMMU groups that contain GPUs considered host-critical are now logged as warnings, keeping host GPU safety visible without blocking VM startup when no passthrough devices live in that group.
+

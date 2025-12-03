@@ -54,6 +54,13 @@ pub fn execute_plan(
                         from_driver: func.driver.clone(),
                         iommu_group: func.iommu_group,
                     });
+                } else {
+                    info!(
+                        vm = plan.vm_name.as_str(),
+                        bdf = action.bdf.as_str(),
+                        "vfio: device already bound to vfio-pci at staging time; \
+                         treating as dedicated passthrough (no restore transition recorded)"
+                    );
                 }
 
                 func.bind_to_vfio_pci()?;
