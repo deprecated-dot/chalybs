@@ -6,6 +6,35 @@
 
 ---
 
+## v1.2.2 – VFIO isolation polish, hugepages manager, Tasmota peripherals
+
+**Status:** working-tree snapshot
+
+### Added
+
+- Stateful node-local hugepages manager that:
+  - mounts a Chalybs-managed `hugetlbfs` at `/dev/hugepages` during `PrepareHugepages`,
+  - raises `nr_hugepages` on the configured NUMA node just-in-time for the VM, and
+  - wraps both provision and cleanup in an explicit pagecache-drop + memory-compaction request, with detailed before/after logging.
+- Peripheral hooks for Tasmota smart power control, driven directly from the `PeripheralHooks` phase:
+  - VM up → publish `POWER ON` to the configured MQTT topic,
+  - VM down → publish `POWER OFF`,
+  - with logs that show broker, topic, and payload so failures can be correlated with lifecycle events.
+
+### Changed
+
+- PCI / VFIO lifecycle:
+  - Treat passthrough devices that are already bound to `vfio-pci` at staging time as **dedicated passthrough**: no restore transition is recorded, and the logs explicitly acknowledge the device as "already vfio-bound".
+  - Extend isolation logging to distinguish between:
+    - host-owned GPUs that remain bound to host drivers (`HostOwned`, detection-only in Phase 2, warnings only in Phase 8/9), and
+    - IOMMU groups that are fully exclusive to the VM (`IOMMU_GROUP_EXCLUSIVE_PASSTHROUGH`).
+  - Make the PCI restore path during shutdown a no-op when there are no recorded transitions, with a summary log covering total/restored/failed devices.
+- Hugepages lifecycle:
+  - Move from a mostly static `nr_hugepages` view to an explicit **stateful hugepages manager** that raises node-local pages for the VM, then returns both node-local and global counts to zero on shutdown and unmounts `/dev/hugepages`.
+- IRQ worker:
+  - Remove the old "wait timer" heuristic for IRQ discovery and rely on the worker thread launched at `DetectMsi` to deterministically discover and pin MSI/MSI-X lines.
+  - Continue treating auxiliary GPU audio functions as IRQ-pinning no-ops (they still live on the VM cpuset by virtue of the device group, but we do not try to micro-optimise them).
+
 ## v1.2.1 – VM state machine & IRQ worker
 
 **Status:** local-only / not yet packaged
