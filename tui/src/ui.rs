@@ -274,14 +274,21 @@ fn build_vm_list_item<'a>(
 
     let state_badge = Span::styled(format!("[{state_label}]"), state_style);
 
-    // Isolation short code for compact badges: DIS/AUD/ENF/other.
-    let iso_code = match vm.isolation_mode.as_str() {
-        "disabled" => "DIS",
-        "audit" => "AUD",
-        "enforce" => "ENF",
-        other => other,
+    // Isolation severity badge (Option A) derived from isolation_mode.
+    //
+    // Semantics:
+    //   disabled -> dim, neutral  "[iso-]"
+    //   audit    -> warn/yellow   "[iso-]"
+    //   enforce  -> ok/green      "[ISO]"
+    //
+    // Any other string falls back to a dim "[iso:?]" style badge.
+    let (iso_text, iso_style) = match vm.isolation_mode.as_str() {
+        "disabled" => ("[iso-]".to_string(), theme::dim_text()),
+        "audit" => ("[iso-]".to_string(), theme::status_warn()),
+        "enforce" => ("[ISO]".to_string(), theme::status_ok()),
+        other => (format!("[iso:{other}]"), theme::dim_text()),
     };
-    let iso_badge = Span::styled(format!("[ISO: {iso_code}]"), theme::dim_text());
+    let iso_badge = Span::styled(iso_text, iso_style);
 
     let tasmota_badge = if vm.tasmota_on {
         Span::styled("[TAS: ON]", theme::status_ok())
@@ -530,11 +537,14 @@ fn draw_vm_detail_modal(f: &mut Frame, app: &App, glitch: &GlitchProfile) {
     let mut lines: Vec<Line> = Vec::new();
 
     if let Some(vm) = app.selected_vm() {
-        let state_label = match vm.state {
-            VmState::Running => "running",
-            VmState::Starting => "starting",
-            VmState::ShuttingDown => "shutting down",
-            VmState::Stopped => "stopped",
+        // State label + styling:
+        // - "running" -> green (status_ok)
+        // - others    -> normal text
+        let (state_label, state_style) = match vm.state {
+            VmState::Running => ("running", theme::status_ok()),
+            VmState::Starting => ("starting", theme::normal_text()),
+            VmState::ShuttingDown => ("shutting down", theme::normal_text()),
+            VmState::Stopped => ("stopped", theme::normal_text()),
         };
 
         lines.push(Line::from(Span::styled(&vm.name, theme::header_title())));
@@ -542,44 +552,80 @@ fn draw_vm_detail_modal(f: &mut Frame, app: &App, glitch: &GlitchProfile) {
 
         lines.push(Line::from(vec![
             Span::styled("state: ", theme::dim_text()),
-            Span::styled(state_label, theme::normal_text()),
+            Span::styled(state_label, state_style),
         ]));
 
+        // CPU pinned: "yes" in green when true.
+        let (cpu_text, cpu_style) = if vm.cpu_pinned {
+            ("yes", theme::status_ok())
+        } else {
+            ("no", theme::normal_text())
+        };
         lines.push(Line::from(vec![
             Span::styled("CPU pinned: ", theme::dim_text()),
-            Span::styled(
-                if vm.cpu_pinned { "yes" } else { "no" },
-                theme::normal_text(),
-            ),
+            Span::styled(cpu_text, cpu_style),
         ]));
 
+        // IRQ pinned: "yes" in green when true.
+        let (irq_text, irq_style) = if vm.irq_pinned {
+            ("yes", theme::status_ok())
+        } else {
+            ("no", theme::normal_text())
+        };
         lines.push(Line::from(vec![
             Span::styled("IRQ pinned: ", theme::dim_text()),
-            Span::styled(
-                if vm.irq_pinned { "yes" } else { "no" },
-                theme::normal_text(),
-            ),
+            Span::styled(irq_text, irq_style),
         ]));
 
+        // Tasmota: "on" in green when true.
+        let (tasmota_text, tasmota_style) = if vm.tasmota_on {
+            ("on", theme::status_ok())
+        } else {
+            ("off", theme::normal_text())
+        };
         lines.push(Line::from(vec![
             Span::styled("Tasmota: ", theme::dim_text()),
-            Span::styled(
-                if vm.tasmota_on { "on" } else { "off" },
-                theme::normal_text(),
-            ),
+            Span::styled(tasmota_text, tasmota_style),
         ]));
+
+        // Isolation: merged into a single line:
+        //
+        //   Isolation: disabled — pass-through isolation disabled
+        //   Isolation: audit    — events logged only (no blocking)
+        //   Isolation: enforce  — policy violations blocked
+        //
+        // Only the *description phrase* is green in enforce mode.
+        let (iso_label, iso_desc, iso_desc_style) = match vm.isolation_mode.as_str() {
+            "disabled" => (
+                "disabled",
+                "pass-through isolation disabled",
+                theme::dim_text(),
+            ),
+            "audit" => (
+                "audit",
+                "events logged only (no blocking)",
+                theme::status_warn(),
+            ),
+            "enforce" => ("enforce", "policy violations blocked", theme::status_ok()),
+            other => (other, "see isolation policy", theme::dim_text()),
+        };
 
         lines.push(Line::from(vec![
             Span::styled("Isolation: ", theme::dim_text()),
-            Span::styled(&vm.isolation_mode, theme::normal_text()),
+            Span::styled(iso_label, theme::normal_text()),
+            Span::raw(" — "),
+            Span::styled(iso_desc, iso_desc_style),
         ]));
 
+        // Hugepages: "enabled" in green when true.
+        let (hp_text, hp_style) = if vm.hugepages {
+            ("enabled", theme::status_ok())
+        } else {
+            ("disabled", theme::normal_text())
+        };
         lines.push(Line::from(vec![
             Span::styled("Hugepages: ", theme::dim_text()),
-            Span::styled(
-                if vm.hugepages { "enabled" } else { "disabled" },
-                theme::normal_text(),
-            ),
+            Span::styled(hp_text, hp_style),
         ]));
 
         lines.push(Line::from(""));

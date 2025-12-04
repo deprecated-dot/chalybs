@@ -433,3 +433,37 @@ earlier Markdown. Refer to repository history for exact changes.
 ### Changed
 - All peripheral badges now fully runtime-driven.
 
+
+## v1.2.4
+- Deterministic PCI slot allocator
+- Adaptive x-vga/multifunction rules
+- rombar_off config
+- Explicit PCI root-port mapping
+- Peripheral hook mutability fixes
+- Tasmota/DDC correctness
+
+------------------------------------------------------------------------
+
+## **Unreleased (v1.3.0 Workstream) --- CPU Model Autodetection Framework**
+
+### Added
+
+-   Initial AMD-only CPU detection path:
+    -   Pure, deterministic classification via `/proc/cpuinfo` +
+        `raw_cpuid`.
+    -   Maps Zen / Zen+ / Zen2 / Zen3 / Zen4 → stable QEMU CPU ABIs.
+    -   Emits resolved CPU ABI in QEMU launch logs.
+
+### Planned (not yet implemented)
+
+-   Intel model-table support:
+    -   Core 6th--14th gen, Core Ultra, Xeon scalable families.
+-   Vendor-agnostic fallback system:
+    -   Deterministic "best-known" ABI for unknown CPUs.
+-   Integration with static-bundled QEMU:
+    -   Ensures ABI availability across all target hosts.
+
+This feature is intentionally staged to avoid regressions in QEMU
+bring-up and will remain opt-in until all model tables are validated.
+
+------------------------------------------------------------------------

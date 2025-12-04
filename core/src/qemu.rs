@@ -1,5 +1,6 @@
 // core/src/qemu.rs
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -43,46 +44,153 @@ fn qmp_path_for_vm(vm_name: &str) -> String {
     format!("/run/chalybs/{vm_name}.qmp")
 }
 
+/// Attempt to auto-detect a suitable QEMU CPU model string (-cpu <model>)
+/// from the host's /proc/cpuinfo.
+///
+/// This is deliberately conservative and *opt-in*:
+///   - Currently handles x86_64 AMD (AuthenticAMD) family >= 0x17, where
+///     using "EPYC-v2" is a safe, well-tested baseline for Zen/Zen+/Zen2-
+///     class hardware on your fleet.
+///   - For everything else, returns None and the caller must fall back
+///     to "host" or whatever the config explicitly requested.
+///
+/// This keeps existing behavior intact and avoids surprising regressions
+/// on non-AMD or very old hardware. Future work can extend this to Intel
+/// and newer AMD generations in a table-driven way.
+fn autodetect_qemu_cpu_model() -> Option<String> {
+    let contents = fs::read_to_string("/proc/cpuinfo").ok()?;
+
+    let mut vendor_id: Option<String> = None;
+    let mut family: Option<u32> = None;
+
+    for line in contents.lines() {
+        let line = line.trim();
+
+        if line.starts_with("vendor_id") {
+            if let Some((_, v)) = line.split_once(':') {
+                vendor_id = Some(v.trim().to_string());
+            }
+        } else if line.starts_with("cpu family") {
+            if let Some((_, v)) = line.split_once(':') {
+                if let Ok(val) = v.trim().parse::<u32>() {
+                    family = Some(val);
+                }
+            }
+        }
+
+        if vendor_id.is_some() && family.is_some() {
+            break;
+        }
+    }
+
+    let vendor = vendor_id?;
+    let family = family?;
+
+    if vendor == "AuthenticAMD" && family >= 0x17 {
+        // Zen and newer (Naples / Threadripper / Ryzen and up).
+        // EPYC-v2 is a known-good baseline on your current fleet.
+        info!(
+            vendor = %vendor,
+            family = family,
+            model = "EPYC-v2",
+            "qemu: auto-detected AMD host, choosing EPYC-v2 CPU model"
+        );
+        Some("EPYC-v2".to_string())
+    } else {
+        info!(
+            vendor = %vendor,
+            family = family,
+            "qemu: CPU autodetect has no mapping for this host; falling back to 'host'"
+        );
+        None
+    }
+}
+
 /// Build the QEMU -cpu argument from config:
-///   - If cpu_extras is present, compose:
-///       "<abi or host>,<topo>,<hv_contexts>,<vendor_id>"
-///     skipping any empty components.
-///   - Otherwise, fall back to "host".
+///
+///   1. If `q.cpu_model` is Some:
+///        - If it is the literal string "auto" (case-insensitive), attempt a
+///          conservative autodetect from /proc/cpuinfo. On failure, fall back
+///          to "host".
+///        - If it is any other non-empty value, use it as the base model
+///          string verbatim.
+///   2. Otherwise, if `cpu_extras` is present:
+///        - Use `cpu_extras.abi` as the base model if non-empty,
+///          otherwise fall back to "host".
+///   3. If neither `cpu_model` nor `cpu_extras` is set, fall back to "host".
+///
+/// In all cases, when `cpu_extras` exists, we append:
+///   "<base>,<topo>,<hv_contexts>,<vendor_id>"
+/// skipping any empty components.
+///
+/// This means:
+///   - You can set `cpu_model = "auto"` to get autodetection *and* still
+///     supply `topo`, `hv_contexts`, and `vendor_id` via `cpu_extras`.
+///   - You can pin an explicit model via `cpu_model = "EPYC-v2"` (or similar)
+///     and still keep the extra flags.
+///   - Legacy configs without `cpu_model` behave as before.
 fn build_cpu_arg(rt: &VmRuntime) -> String {
     let q = &rt.cfg.qemu;
 
-    if let Some(extra) = &q.cpu_extras {
-        let mut parts = Vec::new();
-
-        let base = extra
-            .abi
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or("host");
-        parts.push(base.to_string());
-
-        if let Some(topo) = extra.topo.as_deref() {
-            if !topo.trim().is_empty() {
-                parts.push(topo.trim().to_string());
+    // 1) Resolve the base CPU model string.
+    let base = if let Some(raw_model) = q
+        .cpu_model
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        if raw_model.eq_ignore_ascii_case("auto") {
+            match autodetect_qemu_cpu_model() {
+                Some(model) => model,
+                None => {
+                    info!(
+                        requested = %raw_model,
+                        "qemu: cpu_model='auto' but autodetect unsupported; falling back to 'host'"
+                    );
+                    "host".to_string()
+                }
             }
+        } else {
+            raw_model.to_string()
         }
-
-        if let Some(hv) = extra.hv_contexts.as_deref() {
-            if !hv.trim().is_empty() {
-                parts.push(hv.trim().to_string());
-            }
+    } else if let Some(extra) = &q.cpu_extras {
+        let abi_raw = extra.abi.as_deref().unwrap_or("").trim();
+        if !abi_raw.is_empty() {
+            abi_raw.to_string()
+        } else {
+            "host".to_string()
         }
-
-        if let Some(vendor) = extra.vendor_id.as_deref() {
-            if !vendor.trim().is_empty() {
-                parts.push(vendor.trim().to_string());
-            }
-        }
-
-        parts.join(",")
     } else {
         "host".to_string()
+    };
+
+    // 2) If there are no extras, just return the base model.
+    let Some(extra) = &q.cpu_extras else {
+        return base;
+    };
+
+    let mut parts = Vec::new();
+    parts.push(base);
+
+    if let Some(topo) = extra.topo.as_deref() {
+        if !topo.trim().is_empty() {
+            parts.push(topo.trim().to_string());
+        }
     }
+
+    if let Some(hv) = extra.hv_contexts.as_deref() {
+        if !hv.trim().is_empty() {
+            parts.push(hv.trim().to_string());
+        }
+    }
+
+    if let Some(vendor) = extra.vendor_id.as_deref() {
+        if !vendor.trim().is_empty() {
+            parts.push(vendor.trim().to_string());
+        }
+    }
+
+    parts.join(",")
 }
 
 /// Inject SMBIOS configuration into the QEMU command (if configured).
@@ -154,15 +262,56 @@ fn apply_smbios_args(cmd: &mut Command, rt: &VmRuntime) {
     }
 }
 
-/// Wire VFIO PCIe devices from VmConfig into the QEMU command line.
+/// Parse and validate a single pci_rootport slot address "0xNN" → u8.
 ///
-/// This is the missing "attach devices to the VM" phase:
-///   - For each GPU, NVMe, NIC, and USB device configured in vm.cfg.devices,
-///     emit a corresponding `-device vfio-pci,host=...`.
-///   - For the first GPU entry, we additionally set `multifunction=on,x-vga=on`
-///     to mirror the typical primary-GPU passthrough semantics used in your
-///     legacy Bash suite (video + audio function pair).
-fn add_vfio_pci_devices(cmd: &mut Command, rt: &VmRuntime) {
+/// Valid range is 0x00–0x1f inclusive; we reserve semantics of which
+/// slots are actually used for automatic allocation separately.
+fn parse_rootport_slot(vm_name: &str, bdf: &str, addr: &str) -> Result<u8> {
+    if addr.len() != 4 || !(addr.starts_with("0x") || addr.starts_with("0X")) {
+        return Err(ChalybsError::Config(format!(
+            "vm {vm_name}: invalid pci_rootport address '{addr}' for device {bdf}; \
+expected '0xNN' with NN in 00-1f"
+        )));
+    }
+
+    let slot_hex = &addr[2..];
+    let slot = u8::from_str_radix(slot_hex, 16).map_err(|_| {
+        ChalybsError::Config(format!(
+            "vm {vm_name}: invalid pci_rootport address '{addr}' for device {bdf}; \
+expected '0xNN' with NN in 00-1f"
+        ))
+    })?;
+
+    if slot > 0x1f {
+        return Err(ChalybsError::Config(format!(
+            "vm {vm_name}: pci_rootport address '{addr}' for device {bdf} is out of range; \
+valid slot range is 0x00-0x1f"
+        )));
+    }
+
+    Ok(slot)
+}
+
+/// Build a deterministic PCI root-port map for all passthrough devices.
+///
+/// Semantics:
+///   - All configured devices under vm.devices.{gpu,nvme,nic,usb} participate.
+///   - Base ordering:
+///       * GPUs  (priority 0), sorted by BDF
+///       * NVMe  (priority 1), sorted by BDF
+///       * NIC   (priority 2), sorted by BDF
+///       * USB   (priority 3), sorted by BDF
+///   - Slots are allocated from 0x01 upward, skipping any slots claimed by
+///     explicit overrides in qemu.pci_rootport.
+///   - Overrides:
+///       * must reference a configured passthrough BDF
+///       * must be of the form "0xNN" with NN ∈ [00,1f]
+///       * must not assign the same slot to multiple devices
+///   - On violation, returns a Config error.
+///
+/// The resulting map contains an entry for *every* configured passthrough
+/// device; apply_rootport_mapping() simply looks up the BDF.
+fn build_pci_rootport_map(rt: &VmRuntime) -> Result<HashMap<String, String>> {
     let DevicesConfig {
         gpu,
         nvme,
@@ -170,16 +319,147 @@ fn add_vfio_pci_devices(cmd: &mut Command, rt: &VmRuntime) {
         usb,
     } = &rt.cfg.devices;
 
-    // GPUs: first entry treated as primary video function.
+    // (priority, bdf)
+    let mut entries: Vec<(u8, String)> = Vec::new();
+
+    fn push_kind(out: &mut Vec<(u8, String)>, priority: u8, list: &Option<Vec<PciDeviceConfig>>) {
+        if let Some(devs) = list.as_ref() {
+            for dev in devs {
+                out.push((priority, dev.pci_address.clone()));
+            }
+        }
+    }
+
+    push_kind(&mut entries, 0, gpu);
+    push_kind(&mut entries, 1, nvme);
+    push_kind(&mut entries, 2, nic);
+    push_kind(&mut entries, 3, usb);
+
+    if entries.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Stable: first by kind priority, then lexicographically by BDF string.
+    entries.sort_by(|(k1, b1), (k2, b2)| k1.cmp(k2).then_with(|| b1.cmp(b2)));
+
+    let configured_bdfs: HashSet<&str> = entries.iter().map(|(_, b)| b.as_str()).collect();
+
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut used_slots: HashSet<u8> = HashSet::new();
+
+    // Seed with explicit overrides from config, validating as we go.
+    if let Some(overrides) = &rt.cfg.qemu.pci_rootport {
+        for (bdf, addr) in overrides {
+            if !configured_bdfs.contains(bdf.as_str()) {
+                return Err(ChalybsError::Config(format!(
+                    "vm {}: pci_rootport override for device {bdf} which is not \
+configured under vm.{}.devices",
+                    rt.name, rt.name
+                )));
+            }
+
+            let slot = parse_rootport_slot(&rt.name, bdf, addr)?;
+            if !used_slots.insert(slot) {
+                return Err(ChalybsError::Config(format!(
+                    "vm {}: pci_rootport slot '{addr}' is assigned to more than one device",
+                    rt.name
+                )));
+            }
+
+            // Canonicalize to lowercase 0xNN.
+            map.insert(bdf.clone(), format!("0x{:02x}", slot));
+        }
+    }
+
+    // Auto-assign remaining devices from 0x01 upward, skipping used slots.
+    let mut next_slot: u8 = 0x01;
+
+    for (_, bdf) in entries {
+        if map.contains_key(&bdf) {
+            continue;
+        }
+
+        while used_slots.contains(&next_slot) {
+            next_slot = next_slot.saturating_add(1);
+        }
+
+        if next_slot > 0x1f {
+            return Err(ChalybsError::Config(format!(
+                "vm {}: more passthrough devices than available PCIe root-port slots (0x01-0x1f)",
+                rt.name
+            )));
+        }
+
+        used_slots.insert(next_slot);
+        map.insert(bdf, format!("0x{:02x}", next_slot));
+        next_slot = next_slot.saturating_add(1);
+    }
+
+    Ok(map)
+}
+
+/// Apply a precomputed root-port mapping for a given BDF, if present.
+///
+/// This simply appends:
+///   ,bus=pcie.0,addr=0xNN
+///
+/// to the device parameter string, using the already-validated address from
+/// build_pci_rootport_map().
+fn apply_rootport_mapping(params: &mut String, bdf: &str, pci_rootport: &HashMap<String, String>) {
+    if let Some(addr) = pci_rootport.get(bdf) {
+        params.push_str(",bus=pcie.0");
+        params.push_str(",addr=");
+        params.push_str(addr);
+    }
+}
+
+/// Wire VFIO PCIe devices from VmConfig into the QEMU command line.
+///
+/// This is the missing "attach devices to the VM" phase:
+///   - For each GPU, NVMe, NIC, and USB device configured in vm.cfg.devices,
+///     emit a corresponding `-device vfio-pci,host=...`.
+///   - For legacy primary GPU configs, when explicitly requested via
+///     `qemu.legacy_primary_gpu = true`, the first GPU entry is marked with
+///     `multifunction=on,x-vga=on` (for pre-UEFI/GOP-era hardware).
+///   - For any device present in `qemu.rombar_off`, add `rombar=0`.
+///   - All passthrough devices are assigned deterministic `bus=pcie.0,addr=`
+///     values via the internal root-port allocator, with any explicit
+///     `qemu.pci_rootport` overrides applied first.
+fn add_vfio_pci_devices(cmd: &mut Command, rt: &VmRuntime) -> Result<()> {
+    let DevicesConfig {
+        gpu,
+        nvme,
+        nic,
+        usb,
+    } = &rt.cfg.devices;
+
+    // Optional list of PCI devices whose option ROM BAR should be disabled.
+    // Entries must be full PCI BDFs, e.g. "0000:49:00.0".
+    let rombar_list: &[String] = rt.cfg.qemu.rombar_off.as_deref().unwrap_or(&[]);
+
+    // Deterministic PCI root-port mapping (including overrides, if any).
+    let pci_rootport = build_pci_rootport_map(rt)?;
+
+    // Whether the first GPU should be treated as a legacy VGA device, i.e.
+    // we explicitly add `multifunction=on,x-vga=on` for pre-UEFI/GOP GPUs.
+    let use_legacy_primary_gpu = rt.cfg.qemu.legacy_primary_gpu;
+
+    // GPUs: first entry optionally treated as primary legacy video function.
     if let Some(gpus) = gpu.as_ref() {
         for (idx, dev) in gpus.iter().enumerate() {
             let mut params = format!("host={}", dev.pci_address);
 
-            if idx == 0 && gpus.len() > 1 {
-                // Primary GPU function (e.g., 0000:4a:00.0 when paired with
-                // 0000:4a:00.1 for audio). We mark it as multifunction + x-vga.
+            if idx == 0 && use_legacy_primary_gpu && gpus.len() > 1 {
+                // Legacy behavior for pre-UEFI/GOP GPUs: mark the primary
+                // function as VGA and multifunction when explicitly requested.
                 params.push_str(",multifunction=on,x-vga=on");
             }
+
+            if rombar_list.iter().any(|bdf| bdf == &dev.pci_address) {
+                params.push_str(",rombar=0");
+            }
+
+            apply_rootport_mapping(&mut params, &dev.pci_address, &pci_rootport);
 
             cmd.arg("-device").arg(format!("vfio-pci,{params}"));
 
@@ -190,12 +470,26 @@ fn add_vfio_pci_devices(cmd: &mut Command, rt: &VmRuntime) {
         }
     }
 
-    // Helper for non-GPU kinds: plain vfio-pci attachment.
-    fn add_generic_list(cmd: &mut Command, list: &Option<Vec<PciDeviceConfig>>, kind: &str) {
+    // Helper for non-GPU kinds: plain vfio-pci attachment, with optional
+    // rombar=0 and deterministic pci_rootport mapping.
+    fn add_generic_list(
+        cmd: &mut Command,
+        list: &Option<Vec<PciDeviceConfig>>,
+        kind: &str,
+        rombar_list: &[String],
+        pci_rootport: &HashMap<String, String>,
+    ) -> Result<()> {
         if let Some(devs) = list.as_ref() {
             for dev in devs {
-                cmd.arg("-device")
-                    .arg(format!("vfio-pci,host={}", dev.pci_address));
+                let mut params = format!("host={}", dev.pci_address);
+
+                if rombar_list.iter().any(|bdf| bdf == &dev.pci_address) {
+                    params.push_str(",rombar=0");
+                }
+
+                apply_rootport_mapping(&mut params, &dev.pci_address, pci_rootport);
+
+                cmd.arg("-device").arg(format!("vfio-pci,{params}"));
 
                 info!(
                     pci = %dev.pci_address,
@@ -204,11 +498,15 @@ fn add_vfio_pci_devices(cmd: &mut Command, rt: &VmRuntime) {
                 );
             }
         }
+
+        Ok(())
     }
 
-    add_generic_list(cmd, nvme, "NVMe");
-    add_generic_list(cmd, nic, "NIC");
-    add_generic_list(cmd, usb, "USB");
+    add_generic_list(cmd, nvme, "NVMe", rombar_list, &pci_rootport)?;
+    add_generic_list(cmd, nic, "NIC", rombar_list, &pci_rootport)?;
+    add_generic_list(cmd, usb, "USB", rombar_list, &pci_rootport)?;
+
+    Ok(())
 }
 
 /// Inject RTC arguments based on QemuConfig.
@@ -292,7 +590,7 @@ pub fn launch(rt: &mut VmRuntime) -> Result<()> {
         .arg("q35,accel=kvm")
         .arg("-drive")
         .arg(format!(
-            "if=pflash,format=raw,readonly,file={}",
+            "if=pflash,format=raw,readonly=on,file={}",
             q.ovmf_code
         ))
         .arg("-drive")
@@ -308,7 +606,7 @@ pub fn launch(rt: &mut VmRuntime) -> Result<()> {
     apply_smbios_args(&mut cmd, rt);
 
     // 5) VFIO PCI devices from VmConfig (GPU, NVMe, NIC, USB).
-    add_vfio_pci_devices(&mut cmd, rt);
+    add_vfio_pci_devices(&mut cmd, rt)?;
 
     // 6) Mid-section extra args (historical `args` field).
     if !q.args.trim().is_empty() {

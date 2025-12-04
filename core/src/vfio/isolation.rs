@@ -1293,4 +1293,230 @@ mod tests {
         // Full isolation evaluation should still succeed (no hard error).
         evaluate_isolation_for_vm("testvm", &cfg, &inv).unwrap();
     }
+
+    // ---------- Option A: NIC/NVMe IsolationLevel tests -------------------
+
+    #[test]
+    fn per_device_forbidden_nvme_produces_violation_finding() {
+        let nvme_bdf = "0000:08:00.0";
+
+        let cfg = VmConfig {
+            cpu: CpuConfig {
+                host_cpus: "0-3".to_string(),
+                vm_cpus: "0-1".to_string(),
+            },
+            qemu: QemuConfig {
+                binary: "/usr/bin/qemu-system-x86_64".to_string(),
+                pre_args: None,
+                args: "".to_string(),
+                post_args: None,
+                num_vcpus: 2,
+                mem_mb: 2048,
+                hugepages: false,
+                ovmf_code: "/usr/share/OVMF/OVMF_CODE.fd".to_string(),
+                ovmf_vars: "/var/lib/libvirt/qemu/nvram/test_VARS.fd".to_string(),
+                smbios: None,
+                cpu_extras: None,
+            },
+            numa: Some(NumaConfig { node: None }),
+            devices: DevicesConfig {
+                gpu: None,
+                nvme: Some(vec![PciDeviceConfig {
+                    pci_address: nvme_bdf.to_string(),
+                    required: true,
+                    level: Some(IsolationLevel::Forbidden),
+                }]),
+                nic: None,
+                usb: None,
+            },
+            gpu: GpuPolicyConfig {
+                allow_single_gpu: false,
+                force_use_igpu: false,
+            },
+            isolation: IsolationPolicyConfig {
+                mode: IsolationMode::Audit,
+                ..IsolationPolicyConfig::default()
+            },
+            peripherals: None,
+        };
+
+        let nvme = make_generic(nvme_bdf, 0x010802, Some("nvme"), Some(10), Some(0));
+
+        let inv = PciInventory {
+            functions: vec![nvme],
+        };
+
+        let policy = &cfg.isolation;
+        let device_contexts = collect_device_contexts(policy, &cfg, &inv).expect("device contexts");
+        let passthrough_bdfs = collect_passthrough_bdfs(&cfg, &inv).expect("passthrough bdfs");
+
+        let mut findings = Vec::new();
+        evaluate_per_device_isolation_levels(
+            "testvm",
+            policy,
+            &inv,
+            &device_contexts,
+            &passthrough_bdfs,
+            &mut findings,
+        );
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.code == "DEVICE_FORBIDDEN_BY_POLICY"
+                    && f.device_bdf.as_deref() == Some(nvme_bdf)),
+            "expected forbidden NVMe to produce DEVICE_FORBIDDEN_BY_POLICY finding, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn per_device_dedicated_nvme_in_shared_group_violates_when_iommu_exclusive_relaxed() {
+        let nvme_bdf = "0000:09:00.0";
+        let host_bdf = "0000:09:00.1";
+
+        let cfg = VmConfig {
+            cpu: CpuConfig {
+                host_cpus: "0-3".to_string(),
+                vm_cpus: "0-1".to_string(),
+            },
+            qemu: QemuConfig {
+                binary: "/usr/bin/qemu-system-x86_64".to_string(),
+                pre_args: None,
+                args: "".to_string(),
+                post_args: None,
+                num_vcpus: 2,
+                mem_mb: 2048,
+                hugepages: false,
+                ovmf_code: "/usr/share/OVMF/OVMF_CODE.fd".to_string(),
+                ovmf_vars: "/var/lib/libvirt/qemu/nvram/test_VARS.fd".to_string(),
+                smbios: None,
+                cpu_extras: None,
+            },
+            numa: Some(NumaConfig { node: None }),
+            devices: DevicesConfig {
+                gpu: None,
+                nvme: Some(vec![PciDeviceConfig {
+                    pci_address: nvme_bdf.to_string(),
+                    required: true,
+                    level: Some(IsolationLevel::Dedicated),
+                }]),
+                nic: None,
+                usb: None,
+            },
+            gpu: GpuPolicyConfig {
+                allow_single_gpu: false,
+                force_use_igpu: false,
+            },
+            isolation: IsolationPolicyConfig {
+                mode: IsolationMode::Audit,
+                require_iommu_exclusive: false,
+                ..IsolationPolicyConfig::default()
+            },
+            peripherals: None,
+        };
+
+        let nvme = make_generic(nvme_bdf, 0x010802, Some("nvme"), Some(11), Some(0));
+        let host = make_generic(host_bdf, 0x020000, Some("e1000e"), Some(11), Some(0));
+
+        let inv = PciInventory {
+            functions: vec![nvme, host],
+        };
+
+        let policy = &cfg.isolation;
+        let device_contexts = collect_device_contexts(policy, &cfg, &inv).expect("device contexts");
+        let passthrough_bdfs = collect_passthrough_bdfs(&cfg, &inv).expect("passthrough bdfs");
+
+        let mut findings = Vec::new();
+        evaluate_per_device_isolation_levels(
+            "testvm",
+            policy,
+            &inv,
+            &device_contexts,
+            &passthrough_bdfs,
+            &mut findings,
+        );
+
+        assert!(
+            findings.iter().any(|f| f.code == "DEVICE_DEDICATED_GROUP_NOT_EXCLUSIVE"
+                && f.device_bdf.as_deref() == Some(nvme_bdf)
+                && f.severity == IsolationSeverity::Violation),
+            "expected dedicated NVMe in shared group to produce DEVICE_DEDICATED_GROUP_NOT_EXCLUSIVE violation; findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn per_device_shared_with_host_nvme_in_shared_group_is_advisory_only() {
+        let nvme_bdf = "0000:0a:00.0";
+        let host_bdf = "0000:0a:00.1";
+
+        let cfg = VmConfig {
+            cpu: CpuConfig {
+                host_cpus: "0-3".to_string(),
+                vm_cpus: "0-1".to_string(),
+            },
+            qemu: QemuConfig {
+                binary: "/usr/bin/qemu-system-x86_64".to_string(),
+                pre_args: None,
+                args: "".to_string(),
+                post_args: None,
+                num_vcpus: 2,
+                mem_mb: 2048,
+                hugepages: false,
+                ovmf_code: "/usr/share/OVMF/OVMF_CODE.fd".to_string(),
+                ovmf_vars: "/var/lib/libvirt/qemu/nvram/test_VARS.fd".to_string(),
+                smbios: None,
+                cpu_extras: None,
+            },
+            numa: Some(NumaConfig { node: None }),
+            devices: DevicesConfig {
+                gpu: None,
+                nvme: Some(vec![PciDeviceConfig {
+                    pci_address: nvme_bdf.to_string(),
+                    required: true,
+                    level: Some(IsolationLevel::SharedWithHost),
+                }]),
+                nic: None,
+                usb: None,
+            },
+            gpu: GpuPolicyConfig {
+                allow_single_gpu: false,
+                force_use_igpu: false,
+            },
+            isolation: IsolationPolicyConfig {
+                mode: IsolationMode::Audit,
+                require_iommu_exclusive: false,
+                ..IsolationPolicyConfig::default()
+            },
+            peripherals: None,
+        };
+
+        let nvme = make_generic(nvme_bdf, 0x010802, Some("nvme"), Some(12), Some(0));
+        let host = make_generic(host_bdf, 0x020000, Some("e1000e"), Some(12), Some(0));
+
+        let inv = PciInventory {
+            functions: vec![nvme, host],
+        };
+
+        let policy = &cfg.isolation;
+        let device_contexts = collect_device_contexts(policy, &cfg, &inv).expect("device contexts");
+        let passthrough_bdfs = collect_passthrough_bdfs(&cfg, &inv).expect("passthrough bdfs");
+
+        let mut findings = Vec::new();
+        evaluate_per_device_isolation_levels(
+            "testvm",
+            policy,
+            &inv,
+            &device_contexts,
+            &passthrough_bdfs,
+            &mut findings,
+        );
+
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.code != "DEVICE_DEDICATED_GROUP_NOT_EXCLUSIVE"
+                    && f.code != "DEVICE_FORBIDDEN_BY_POLICY"),
+            "SharedWithHost NVMe should not produce dedicated/forbidden violations; findings: {findings:?}"
+        );
+    }
 }
