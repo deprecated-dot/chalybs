@@ -119,12 +119,56 @@ pub struct QemuConfig {
     #[serde(default)]
     pub smbios: Option<SmbiosConfig>,
 
+    /// Optional base CPU model string for QEMU -cpu.
+    ///
+    /// When set:
+    ///   - "auto" (case-insensitive) → request autodetection based on
+    ///     /proc/cpuinfo (currently AMD Zen+ mapping to "EPYC-v2").
+    ///   - any other non-empty string → used verbatim as the base model
+    ///     (e.g. "EPYC-v2", "Skylake-Server", etc.).
+    ///
+    /// When unset, the base model falls back to `cpu_extras.abi` if present
+    /// or "host" as a final default.
+    #[serde(default)]
+    pub cpu_model: Option<String>,
+
     /// Optional CPU model / feature / hypervisor extras.
     ///
     /// This is where "ABI / TOPO / HV_CONTEXTS / VENDOR_ID" from the
     /// legacy Bash suite live.
     #[serde(default)]
     pub cpu_extras: Option<CpuExtrasConfig>,
+
+    /// Optional list of PCI devices whose option ROM BAR should be disabled.
+    ///
+    /// Entries must be full PCI BDFs, e.g. "0000:49:00.0". When a device
+    /// in this list is attached via vfio-pci, Chalybs adds `rombar=0` to the
+    /// corresponding `-device` argument.
+    #[serde(default)]
+    pub rombar_off: Option<Vec<String>>,
+
+    /// Optional mapping from passthrough PCI devices to deterministic
+    /// root-port addresses on the Q35 root complex.
+    ///
+    /// Keys are full PCI BDFs, e.g. "0000:49:00.0".
+    /// Values are hex slot addresses of the form "0xNN" where NN ∈ [00,1f].
+    ///
+    /// When present, these entries *override* the automatic allocator for the
+    /// corresponding devices. All other passthrough devices are assigned
+    /// stable, deterministic slots by Chalybs according to a fixed priority
+    /// and BDF ordering.
+    #[serde(default)]
+    pub pci_rootport: Option<HashMap<String, String>>,
+
+    /// If true, the first configured GPU for this VM is treated as a legacy
+    /// VGA device and Chalybs will add `x-vga=on,multifunction=on` to its
+    /// vfio-pci `-device` argument.
+    ///
+    /// This is intended only for truly legacy, pre-UEFI/GOP GPUs. For modern
+    /// GPUs (Ampere, RDNA2, etc.) this should remain false so they behave as
+    /// pure PCIe devices without legacy VGA routing or extra enumeration.
+    #[serde(default)]
+    pub legacy_primary_gpu: bool,
 }
 
 /// NUMA policy (optional)

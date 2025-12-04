@@ -448,3 +448,6 @@ the earlier narrative sections.
   - payload,
   so failures can be correlated with specific lifecycle phases.
 
+
+### Deterministic PCI Slot Allocator
+Added allocator with strict BDF ordering and stable mapping.
