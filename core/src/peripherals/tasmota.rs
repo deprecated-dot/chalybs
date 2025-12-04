@@ -64,18 +64,12 @@ impl TasmotaHook {
 
     /// Publish "ON" or "OFF" to cmnd/<device_id>/POWER.
     ///
-    /// ALL errors are soft-fail: warnings only, return Ok(()).
+    /// On success, returns Ok(()).
+    /// On failure, returns Err(ChalybsError::Peripheral(...)) so callers
+    /// can reflect the outcome in VM runtime state and events while still
+    /// treating failures as non-fatal.
     fn publish_power(&self, on: bool) -> Result<()> {
-        let (host, port) = match self.parse_mqtt_host() {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    "Tasmota MQTT: invalid mqtt_host `{}`: {e}",
-                    self.cfg.mqtt_host
-                );
-                return Ok(()); // SOFT FAIL
-            }
-        };
+        let (host, port) = self.parse_mqtt_host()?;
 
         let topic = format!("cmnd/{}/POWER", self.cfg.device_id);
         let payload = if on { "ON" } else { "OFF" };
@@ -117,29 +111,35 @@ impl TasmotaHook {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        warn!("Tasmota MQTT: connection error before publish: {e}");
-                        return Ok(()); // SOFT FAIL
+                        return Err(ChalybsError::Peripheral(format!(
+                            "tasmota: connection error before publish: {e}"
+                        )));
                     }
                 }
+            } else {
+                break;
             }
         }
 
         if !connected {
-            warn!("Tasmota MQTT: never received ConnAck before publish");
-            return Ok(()); // SOFT FAIL
+            return Err(ChalybsError::Peripheral(
+                "tasmota: never received ConnAck before publish".into(),
+            ));
         }
 
-        // Publish (soft-fail)
         if let Err(e) = client.publish(topic.as_str(), QoS::AtLeastOnce, false, payload.as_bytes())
         {
-            warn!("Tasmota MQTT: publish error on `{topic}`: {e}");
-            return Ok(()); // SOFT FAIL
+            return Err(ChalybsError::Peripheral(format!(
+                "tasmota: publish error on `{topic}`: {e}"
+            )));
         }
 
         // One more poll to flush PUBLISH
         if let Some(res) = iter.next() {
             if let Err(e) = res {
-                warn!("Tasmota MQTT: eventloop error after publish: {e}");
+                return Err(ChalybsError::Peripheral(format!(
+                    "tasmota: eventloop error after publish: {e}"
+                )));
             }
         }
 
@@ -148,13 +148,39 @@ impl TasmotaHook {
 }
 
 impl PeripheralHook for TasmotaHook {
-    fn vm_up(&self, _rt: &VmRuntime) -> Result<()> {
+    fn vm_up(&self, rt: &mut VmRuntime) -> Result<()> {
         info!("Tasmota: VM up → POWER ON");
-        self.publish_power(true)
+
+        match self.publish_power(true) {
+            Ok(()) => {
+                rt.tasmota_powered.set(true);
+            }
+            Err(e) => {
+                rt.tasmota_powered.set(false);
+                warn!("Tasmota MQTT: POWER ON failed: {e}");
+                rt.push_warning(format!("tasmota: MQTT POWER ON failed: {e}"));
+            }
+        }
+
+        // SOFT FAIL: never abort VM bring-up
+        Ok(())
     }
 
-    fn vm_down(&self, _rt: &VmRuntime) -> Result<()> {
+    fn vm_down(&self, rt: &mut VmRuntime) -> Result<()> {
         info!("Tasmota: VM down → POWER OFF");
-        self.publish_power(false)
+
+        match self.publish_power(false) {
+            Ok(()) => {
+                rt.tasmota_powered.set(false);
+            }
+            Err(e) => {
+                rt.tasmota_powered.set(false);
+                warn!("Tasmota MQTT: POWER OFF failed: {e}");
+                rt.push_warning(format!("tasmota: MQTT POWER OFF failed: {e}"));
+            }
+        }
+
+        // SOFT FAIL: never abort VM shutdown
+        Ok(())
     }
 }

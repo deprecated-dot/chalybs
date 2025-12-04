@@ -222,7 +222,7 @@ impl VmStateMachine {
                 info!("state=PeripheralHooks");
                 self.rt.push_system("state=PeripheralHooks");
 
-                crate::peripherals::apply_vm_up(&self.rt)?;
+                crate::peripherals::apply_vm_up(&mut self.rt)?;
                 self.rt
                     .push_info("peripherals: VM up hooks applied successfully");
 
@@ -337,7 +337,7 @@ impl VmStateMachine {
                     .push_info("hugepages: teardown completed for VM instance");
 
                 // Phase 14: peripheral VM-down hooks (Tasmota, etc.)
-                crate::peripherals::apply_vm_down(&self.rt)?;
+                crate::peripherals::apply_vm_down(&mut self.rt)?;
                 self.rt
                     .push_info("peripherals: VM down hooks applied successfully");
 
