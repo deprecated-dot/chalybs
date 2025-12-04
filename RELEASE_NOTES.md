@@ -1,3 +1,6 @@
+## v1.2.4
+Deterministic PCI slot allocator; adaptive x-vga/multifunction; ROMBAR suppression; root-port mapping; peripheral fixes; TUI correctness; stability.
+
 ## v1.2.3 (2025-12-03)
 
 ### Fixed

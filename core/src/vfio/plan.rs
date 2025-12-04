@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use tracing::debug;
 
-use crate::config::{PciDeviceConfig, VmConfig};
+use crate::config::{IsolationLevel, PciDeviceConfig, VmConfig};
 use crate::errors::{ChalybsError, Result};
 use crate::pci::{GpuUnbindAssessment, GpuUnbindFeasibility, PciFunction, PciInventory};
 
@@ -241,6 +241,18 @@ fn stage_device_list(
         _ => return Ok(()),
     };
 
+    // IsolationLevel::Forbidden is a hard VM-config-level veto for
+    // non-GPU device lists: if a device is marked forbidden, this VM
+    // must not attempt to passthrough it at all.
+    for cfg in cfgs {
+        if cfg.level == Some(IsolationLevel::Forbidden) {
+            return Err(ChalybsError::Vfio(format!(
+                "VM {vm_name}: device {} is forbidden for passthrough by policy",
+                cfg.pci_address
+            )));
+        }
+    }
+
     let funcs = inv.resolve_configured(cfgs)?;
 
     for func in funcs {
@@ -276,8 +288,15 @@ mod tests {
                 ovmf_vars: "/var/lib/libvirt/qemu/nvram/test_VARS.fd".to_string(),
                 smbios: None,
                 cpu_extras: None,
+                rombar_off: None,
+                pci_rootport: None,
+                legacy_primary_gpu: false,
+                rtc: None,
             },
-            numa: Some(NumaConfig { node: None }),
+            numa: Some(NumaConfig {
+                node: None,
+                hugepage_node: None,
+            }),
             devices: DevicesConfig {
                 gpu: Some(vec![PciDeviceConfig {
                     pci_address: bdf.to_string(),
