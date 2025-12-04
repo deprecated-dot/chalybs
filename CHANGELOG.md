@@ -424,3 +424,15 @@ earlier Markdown. Refer to repository history for exact changes.
 ### Fixed
 - Deserialize errors
 - Removed stray semicolon
+
+## [1.2.3] - 2025-12-03
+### Fixed
+- Tasmota MQTT publish correctness and ConnAck sequencing.
+- Peripheral hook borrow discipline (&mut VmRuntime).
+- Daemon state-machine truth reporting for CPU/IRQ/Tasmota.
+- TUI badge mismatch between config and runtime state.
+- Stale tasmota_configured removed.
+
+### Changed
+- All peripheral badges now fully runtime-driven.
+

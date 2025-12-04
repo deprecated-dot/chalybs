@@ -254,10 +254,10 @@ impl DaemonState {
                     drive_vm_towards_desired(dvm);
 
                     let view_state = map_vm_state_to_ipc(dvm.sm.state);
-                    let cpu_pinned = dvm.sm.rt.pinned_threads;
-                    let irq_pinned = dvm.sm.rt.pinned_irqs;
+                    let mut cpu_pinned = dvm.sm.rt.pinned_threads;
+                    let mut irq_pinned = dvm.sm.rt.pinned_irqs;
 
-                    let tasmota_on = dvm
+                    let tasmota_configured = dvm
                         .sm
                         .rt
                         .cfg
@@ -266,15 +266,20 @@ impl DaemonState {
                         .and_then(|p| p.tasmota.as_ref())
                         .is_some();
 
+                    // NOTE: tasmota_powered is a Cell<bool>; read with .get()
+                    let mut tasmota_on = tasmota_configured && dvm.sm.rt.tasmota_powered.get();
+
+                    // FIXED: use matches!() instead of == (IpcVmState does NOT implement PartialEq)
+                    if matches!(view_state, IpcVmState::Stopped) {
+                        cpu_pinned = false;
+                        irq_pinned = false;
+                        tasmota_on = false;
+                    }
+
                     (view_state, cpu_pinned, irq_pinned, tasmota_on)
                 } else {
-                    let tasmota_on = vm_cfg
-                        .peripherals
-                        .as_ref()
-                        .and_then(|p| p.tasmota.as_ref())
-                        .is_some();
-
-                    (IpcVmState::Stopped, false, false, tasmota_on)
+                    // VM is configured but has no active daemon-side state machine.
+                    (IpcVmState::Stopped, false, false, false)
                 };
 
                 let isolation_mode = match vm_cfg.isolation.mode {

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::process::Child;
 
 use serde::Serialize;
@@ -107,6 +108,13 @@ pub struct VmRuntime {
     pub hugepages_pages: u64,
     pub hugepages_bytes: u64,
     pub hugepages_active: bool,
+
+    /// Best-known Tasmota relay state for this VM.
+    ///
+    /// This is updated by the Tasmota peripheral hook based on the
+    /// outcome of MQTT POWER publishes and is consumed by the daemon
+    /// when building IPC snapshots.
+    pub tasmota_powered: Cell<bool>,
 }
 
 impl VmRuntime {
@@ -125,6 +133,7 @@ impl VmRuntime {
             hugepages_pages: 0,
             hugepages_bytes: 0,
             hugepages_active: false,
+            tasmota_powered: Cell::new(false),
         }
     }
 
