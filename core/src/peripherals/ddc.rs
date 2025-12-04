@@ -55,11 +55,11 @@ impl DdcHook {
 }
 
 impl PeripheralHook for DdcHook {
-    fn vm_up(&self, _rt: &VmRuntime) -> Result<()> {
+    fn vm_up(&self, _rt: &mut VmRuntime) -> Result<()> {
         self.set_input(self.cfg.vm_input)
     }
 
-    fn vm_down(&self, _rt: &VmRuntime) -> Result<()> {
+    fn vm_down(&self, _rt: &mut VmRuntime) -> Result<()> {
         self.set_input(self.cfg.host_input)
     }
 }

@@ -1,3 +1,21 @@
+## v1.2.3 (2025-12-03)
+
+### Fixed
+- Deterministic Tasmota MQTT sequencing with ConnAck gating.
+- Tasmota badge reflects actual runtime MQTT success/failure.
+- TUI badge truth-sourcing for CPU/IRQ/Tasmota ON/OFF and reset on STOPPED.
+- Corrected &mut VmRuntime peripheral hook signatures.
+- Removed synthetic tasmota_configured; runtime truth only.
+- Daemon: fixed IpcVmState comparison and Cell<bool> handling.
+- Correct badge reset behavior after shutdown.
+
+### Changed
+- Peripheral hooks now mutate VmRuntime directly.
+- Tasmota runtime state elevated as canonical truth source.
+
+### Notes
+This is a patch release containing no breaking changes.
+
 # Chalybs v1.2.2 Release Notes
 
 This release tightens the PCI/VFIO lifecycle for dedicated passthrough devices, makes
