@@ -80,6 +80,9 @@ the TUI rides on top as a strictly cosmetic/control surface.
   - Rebind devices
   - Inspect VFIO plan / inventory
 - “Event detail” modal (stacked modals).
+- VM detail modal surfaces isolation policy/mode/default level, IRQ pinning, hugepage
+  state, and peripheral status using a deterministic legend and color scheme
+  (landed in v1.3.0).
 - Sidebar expander for CPU/IRQ heatmaps.
 - Better terminal-agnostic layout (80x24 compatibility mode).
 - Optional kitty-graphics renderer for PCI diagrams and heatmaps.
@@ -196,48 +199,3 @@ v1.2.2 checkpoint (2025-12-03)
 
 - Completed: Deterministic PCI slot allocator, GPU arg logic.
 - Next: Additional feature phases.
-
-------------------------------------------------------------------------
-
-## **Upcoming: CPU Model Autodetection (v1.3.x -- v1.4.x)**
-
-Chalybs currently depends on manually specifying the QEMU CPU ABI
-(`EPYC-v2`, etc.).\
-The long-term goal is a **fully portable**, **deterministic**, and
-**zero-heuristics** CPU-model selection system.
-
-### Phase 1 --- AMD Zen-only autodetection (✔ now implemented in working tree)
-
--   Use `/proc/cpuinfo`, `cpuid` crate, and vendor strings to classify:
-    -   Zen / Zen+ / Zen2 / Zen3 / Zen4
-    -   Threadripper variants
--   Map each family/model to a **stable QEMU CPU ABI**.
--   Fallback: "host" when unknown (still deterministic given
-    vendor/model).
-
-### Phase 2 --- Intel + mixed-vendor expansion (future)
-
--   Extend model tables to cover:
-    -   Intel Core 6th--14th gen
-    -   Core Ultra / Meteor Lake
-    -   Xeon scalable families (Skylake → Sapphire Rapids)
--   Provide exact QEMU CPU names for each, matching bundled QEMU
-    baseline.
-
-### Phase 3 --- Fully portable CPU ABI layer
-
--   Eliminate config-time CPU ABI entirely unless overridden.
--   Deterministic table-driven mapping, zero guessing.
--   Logged model → ABI resolution as part of Preflight state.
-
-### Phase 4 --- Bundled QEMU future-proofing
-
--   Once Chalybs ships with pinned QEMU (musl-static bundle), the
-    autodetector can depend on a **known, consistent QEMU model set**,
-    eliminating old-host variability.
-
-This workstream is explicitly tied to the static-binary build suite and
-QEMU bundling efforts.
-
-------------------------------------------------------------------------
-
