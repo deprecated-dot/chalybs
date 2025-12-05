@@ -451,3 +451,51 @@ the earlier narrative sections.
 
 ### Deterministic PCI Slot Allocator
 Added allocator with strict BDF ordering and stable mapping.
+
+### QEMU CPU Model Autodetection (v1.3.0)
+
+Chalybs now supports a deterministic, config-driven QEMU `-cpu` model selection
+pipeline. The goals are:
+
+- Keep existing “just use host” behavior stable by default.
+- Allow explicit, opt-in CPU model autodetection for AMD Zen-class hosts.
+- Preserve the legacy `cpu_extras` surface (`abi`, `topo`, `hv_contexts`,
+  `vendor_id`) without regressions.
+
+**Config surface**
+
+- `qemu.cpu_model` (optional):
+  - `None` → fall back to `cpu_extras.abi` if set, otherwise `"host"`.
+  - `"auto"` (case-insensitive) → invoke the autodetector.
+  - Any other non-empty string → used verbatim as the base QEMU CPU model.
+- `qemu.cpu_extras` (optional):
+  - `abi`       → optional explicit base model when `cpu_model` is not set.
+  - `topo`      → appended as-is (e.g. topology/feature flags).
+  - `hv_contexts` → hypervisor feature set (e.g. `hv-stimer,hv-time,...`).
+  - `vendor_id` → hypervisor vendor ID fragment.
+
+The final `-cpu` string is assembled as:
+
+- Resolve **base model** in this order:
+  1. `qemu.cpu_model` (explicit string), or
+  2. `qemu.cpu_model = "auto"` → autodetect, or
+  3. `cpu_extras.abi`, or
+  4. `"host"` as a conservative default.
+- If `cpu_extras` is present, append non-empty `topo`, `hv_contexts`, and
+  `vendor_id` segments, comma-separated, to the base model.
+
+**Autodetect behavior (v1.3.0)**
+
+- Implementation reads `/proc/cpuinfo` once and extracts:
+  - `vendor_id`
+  - `cpu family`
+- Current mapping is intentionally conservative and narrow:
+  - If `vendor_id == "AuthenticAMD"` and `family >= 0x17` (Zen-class
+    hosts, including Threadripper and EPYC on your fleet) → use
+    `EPYC-v2` as the base model.
+  - Otherwise → autodetect returns `None` and the system falls back to
+    `"host"` (or an explicitly configured base model).
+
+This keeps non-AMD or older/unknown CPUs on the fully backward-compatible
+path while still giving modern AMD hosts a deterministic, “known-good”
+QEMU CPU ABI without hand-tuning per VM.

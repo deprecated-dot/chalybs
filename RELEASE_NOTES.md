@@ -1,3 +1,21 @@
+## v1.3.0 (2025-12-05)
+
+### New
+
+- QEMU CPU model autodetection for AMD Zen-class hosts:
+  - `qemu.cpu_model = "auto"` now inspects `/proc/cpuinfo` and maps
+    AuthenticAMD family ≥ 0x17 to `EPYC-v2` as a conservative, known-good
+    baseline on the current fleet.
+  - Existing `cpu_extras` remain fully honored: ABI/topology, hypervisor
+    contexts, and vendor ID are appended on top of the detected model.
+
+### Changed
+
+- TUI VM detail modal now surfaces isolation policy/mode/default level,
+  IRQ pinning, hugepage backing, and peripheral status using a stable,
+  deterministic color/format legend. Isolation-related states are now
+  visually consistent and easier to reason about at a glance.
+
 ## v1.2.4
 Deterministic PCI slot allocator; adaptive x-vga/multifunction; ROMBAR suppression; root-port mapping; peripheral fixes; TUI correctness; stability.
 
