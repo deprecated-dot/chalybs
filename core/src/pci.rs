@@ -494,7 +494,7 @@ impl PciInventory {
             .collect()
     }
 
-    /// Return all functions that look like network controllers.
+    /// Return all functions that look like network connectors.
     pub fn nics(&self) -> Vec<&PciFunction> {
         self.functions
             .iter()
@@ -577,12 +577,24 @@ impl PciInventory {
     /// Return true if the given BDF appears to be part of a "GPU complex"
     /// at the slot level: at least one function in the same
     /// (domain,bus,slot) triple is a display controller.
+    ///
+    /// **Important**: this is defined only for devices that actually
+    /// exist in this inventory snapshot. A synthetic or unknown BDF
+    /// with a matching slot does *not* count.
     pub fn is_bdf_in_gpu_complex(&self, bdf: &str) -> bool {
         let key = match parse_bdf_slot(bdf) {
             Some(k) => k,
             None => return false,
         };
 
+        // First, require that this BDF is present in the inventory at all.
+        if !self.functions.iter().any(|f| f.bdf == bdf) {
+            return false;
+        }
+
+        // Then, check whether any function in the same slot is a display
+        // controller (GPU). This includes the BDF itself when it is
+        // the GPU function.
         for func in &self.functions {
             if let Some(fkey) = func.slot_key() {
                 if fkey == key && func.is_display_controller() {
