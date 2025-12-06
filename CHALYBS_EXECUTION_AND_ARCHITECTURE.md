@@ -499,3 +499,105 @@ The final `-cpu` string is assembled as:
 This keeps non-AMD or older/unknown CPUs on the fully backward-compatible
 path while still giving modern AMD hosts a deterministic, “known-good”
 QEMU CPU ABI without hand-tuning per VM.
+
+## 9. CPU planning and QEMU launch builder (v1.3.5)
+
+This section documents the CPU planning and QEMU launch refactor introduced in v1.3.5. It is additive to the earlier sections and does not change the fundamental phase ordering; instead, it makes the CPU and QEMU layers explicit, declarative, and testable.
+
+### 9.1 Host NUMA topology discovery
+
+The `cpu::detect` module now exposes both:
+
+- `CpuIdentity` – vendor, family, model, stepping, and model name.
+- `HostNumaTopology` – a deterministic view of the host NUMA layout built from sysfs.
+
+Key properties:
+
+- **Source of truth**: NUMA topology is derived from sysfs, not shell commands or heuristics.
+- **Ordering**: Nodes and CPUs are stored in stable, deterministic order suitable for logging and planning.
+- **Logging**: On VM start, Chalybs logs the discovered topology alongside the resolved `CpuIdentity` and QEMU CPU model.
+
+This topology is used by the CPU planner and IRQ pinning code to ensure that VM vCPUs and passthrough device IRQs are kept NUMA-local wherever possible.
+
+### 9.2 CpuPlan and validation
+
+On top of `CpuIdentity` and `HostNumaTopology`, Chalybs now builds a declarative `CpuPlan` for each VM. The plan captures:
+
+- The VM's vCPU count and index range.
+- The target NUMA node(s) for the VM.
+- The mapping from vCPU indices → host CPUs.
+- The relationship between the VM cpuset (`vfio_vm`), host cpuset (`vfio_host`), and the hugepage allocation node.
+
+The planner enforces:
+
+- **Consistency with config** – the requested vCPU count and NUMA node(s) must be satisfiable given the host topology and cpuset layout.
+- **Alignment with hugepages** – when hugepages are enabled, the VM's CPUs must come from the same NUMA node used for hugepage allocation.
+- **No silent downgrades** – if the requested plan cannot be satisfied, Chalybs fails the VM start during `Validate` instead of "best-effort" behavior.
+
+Integration points:
+
+- `Validate`:
+  - Builds a `CpuPlan` from the VM config and host topology.
+  - Performs structural checks and surfaces any inconsistencies as hard errors.
+- `ReserveCpus`:
+  - Applies the plan to the cpuset hierarchy.
+  - Establishes the `vfio_vm` and `vfio_host` cpusets consistent with the plan and NUMA node selection.
+- `PinVcpus`:
+  - Uses the plan to pin each QEMU vCPU thread deterministically to a host CPU.
+
+### 9.3 QEMU command model and builder
+
+The QEMU launch path is now split into:
+
+- A **declarative command model** (`QemuCommand`), and
+- A **builder** (`QemuCommandBuilder`) that assembles the argument vector.
+
+`QemuCommand` contains:
+
+- `binary: String` – the QEMU binary path from config.
+- `args: Vec<String>` – the full, ordered argument vector.
+- `qmp_path: String` – the derived QMP socket path for the VM.
+
+`QemuCommandBuilder` is responsible for constructing `QemuCommand` in phases that mirror the existing architecture:
+
+1. **Pre-arguments** – `qemu.pre_args`, split on whitespace and injected verbatim before all core arguments.
+2. **Core arguments**:
+   - `-enable-kvm`
+   - `-cpu <model>` built via `build_cpu_arg()` using the CPU detection subsystem and any configured `cpu_extras`.
+   - `-smp <vcpus>` and `-m <mem_mb>` from config.
+   - Optional hugepage wiring when `rt.hugepages_active` is set:
+     - `-mem-prealloc -mem-path /dev/hugepages`
+3. **Machine, firmware, and QMP**:
+   - `-machine q35,accel=kvm`
+   - OVMF pflash drives for `ovmf_code` and `ovmf_vars`.
+   - `-qmp unix:/run/chalybs/<vm>.qmp,server,nowait`
+4. **RTC** – via a dedicated helper that enforces the three-way behavior:
+   - Explicit `-rtc <value>` when `qemu.rtc` is non-empty.
+   - No `-rtc` when `qemu.rtc` is explicitly empty.
+   - Default `-rtc base=localtime,driftfix=slew` when `qemu.rtc` is `None`.
+5. **SMBIOS** – via a helper that emits type 0/1/2 records only when non-empty fields are configured.
+6. **vfio-pci devices**:
+   - Deterministic PCIe root-port mapping for all passthrough devices using a single allocator:
+     - All devices under `vm.devices.{gpu,nvme,nic,usb}` participate.
+     - Slots are allocated from `0x01` upward, with `qemu.pci_rootport` overrides applied and validated first.
+   - Construction of `-device vfio-pci,...` arguments, including optional `rombar=0` for BDFs listed in `qemu.rombar_off`.
+   - Optional legacy primary GPU flags (`multifunction=on,x-vga=on`) when `qemu.legacy_primary_gpu` is set.
+7. **Mid-arguments** – `qemu.args` injected verbatim.
+8. **Post-arguments** – `qemu.post_args` injected verbatim at the tail.
+
+The `launch()` function now:
+
+- Invokes `QemuCommandBuilder` to obtain a fully-constructed `QemuCommand`.
+- Logs the binary, arguments, and QMP path in a structured way.
+- Builds a `std::process::Command` from `QemuCommand` without re-implementing any argument logic.
+- Spawns QEMU, logs the PID, and moves the process into the VM cpuset when configured, as before.
+
+### 9.4 Invariants and non-goals
+
+- No heuristics:
+  - The builder does not "guess" or silently fix invalid configurations; it either produces a deterministic command or fails before QEMU is spawned.
+- No behavioral drift:
+  - Defaults for CPU model, RTC, SMBIOS, firmware, and vfio wiring are preserved relative to prior releases.
+- Determinism:
+  - Given the same config and host topology, the resulting `QemuCommand` (including PCIe addresses for passthrough devices) is bit-for-bit stable.
+

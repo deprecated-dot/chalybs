@@ -442,3 +442,47 @@ earlier Markdown. Refer to repository history for exact changes.
 - Peripheral hook mutability fixes
 - Tasmota/DDC correctness
 
+## v1.3.5 – CPU planning and QEMU command builder
+
+_Date: 2025-12-06_
+
+### Added
+
+- Host CPU detection subsystem that identifies the concrete host CPU (`CpuIdentity`) and maps it to a QEMU CPU model (e.g. `EPYC-v2`) via `cpu::detect`.
+- NUMA topology discovery via sysfs (`cpu::detect::topology`), exposing a deterministic `HostNumaTopology` with per-node CPU lists.
+- CPU planning / validation pipeline that builds a declarative `CpuPlan` from config and validates it against:
+  - VM vCPU count and layout
+  - NUMA node placement
+  - cpuset / cgroup configuration
+  - hugepage provisioning
+- Declarative QEMU command model:
+  - `QemuCommand` struct representing the full QEMU invocation.
+  - `QemuCommandBuilder` that assembles the argument vector in a deterministic, testable way.
+- Deterministic PCIe root-port allocator for passthrough devices:
+  - Stable ordering by device kind (GPU, NVMe, NIC, USB) and BDF.
+  - Explicit `qemu.pci_rootport` overrides validated for range, uniqueness, and membership in the VM's passthrough set.
+  - Canonical `bus=pcie.0,addr=0xNN` wiring applied to all vfio-pci devices.
+- Structured logging around CPU detection, NUMA topology, CPU planning, and QEMU launch, including the resolved CPU model and hugepage details.
+
+### Changed
+
+- QEMU launch path refactored to use `QemuCommandBuilder`:
+  - All previous behavior for CPU model selection, memory size, hugepages, firmware drives, QMP socket, RTC, SMBIOS, and device wiring is preserved.
+  - The builder is now the single source of truth for QEMU arguments; `launch()` is responsible only for turning the declarative command into a `std::process::Command` and moving the child into the VM cpuset.
+- `build_cpu_arg()` now:
+  - Honors `qemu.cpu_model = "auto"` by delegating to the CPU detection subsystem, falling back hard to `"host"` if detection cannot produce a supported model.
+  - Allows explicit `cpu_model` strings (e.g. `EPYC-v2`) to coexist with `cpu_extras` overlays.
+  - Preserves legacy semantics when `cpu_model` is unset and only `cpu_extras` or neither field is present.
+
+### Fixed
+
+- Configuration errors around `qemu.pci_rootport` are now explicit hard failures:
+  - Invalid slot encodings (non-`0xNN` values) are rejected.
+  - Out-of-range slots (outside `0x00–0x1f`) are rejected.
+  - Duplicate slot assignments across devices are rejected.
+  - Overrides that reference non-configured passthrough BDFs are rejected.
+- RTC configuration builder is centralized and guarantees:
+  - Exact `-rtc <value>` when `qemu.rtc` is set to a non-empty string.
+  - No `-rtc` argument at all when `qemu.rtc` is explicitly empty/whitespace.
+  - Legacy default of `-rtc base=localtime,driftfix=slew` when `qemu.rtc` is `None`.
+

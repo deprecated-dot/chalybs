@@ -1,6 +1,7 @@
 pub mod affinity;
 pub mod config;
 pub mod cpu;
+pub mod cpuplan;
 pub mod cpuset;
 pub mod errors;
 pub mod hugepages;
