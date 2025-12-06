@@ -408,3 +408,77 @@ Warnings exist but are strictly cosmetic (unused struct fields from mock data).
 - Removed stray semicolon in QemuConfig
 - Fixed Deserialize failures
 - Ensured full-file synchronization correctness
+
+## v1.3.5 – CPU planner & QEMU launch builder
+
+This release hardens the CPU and QEMU layers so that they behave like the rest of Chalybs: declarative, deterministic, and intolerant of silent drift. It introduces a real CPU detection / planning subsystem and a structured QEMU command builder, while preserving the external behavior of existing configurations.
+
+### Highlights
+
+- Deterministic host CPU detection with explicit mapping to QEMU CPU models.
+- NUMA-aware CPU planning and validation, wired into the existing state machine.
+- Declarative QEMU command representation and builder, with strict invariants.
+- Deterministic PCIe root-port mapping for vfio-pci passthrough devices.
+- Centralized RTC + SMBIOS argument construction.
+
+### CPU detection & planning
+
+- `cpu::detect` now exposes:
+  - `CpuIdentity` (vendor, family, model, stepping, and model name).
+  - A stable mapping from `CpuIdentity` to a supported QEMU CPU model string (e.g. `EPYC-v2`).
+  - `HostNumaTopology` discovered from sysfs, with explicit per-node CPU lists.
+- `build_cpu_arg()` now supports three explicit modes:
+  - `cpu_model = "auto"` → query `cpu::detect` for the best supported model, falling back to `"host"` on unsupported hardware.
+  - `cpu_model = "<explicit>"` → use the provided string as the base model and still apply `cpu_extras` overlays.
+  - Legacy behavior when `cpu_model` is unset (with or without `cpu_extras`).
+- A new CPU planning layer:
+  - Builds a `CpuPlan` from the VM config, host topology, and hugepage placement.
+  - Validates that vCPU count, NUMA placement, and cpusets are coherent.
+  - Fails hard during `Validate` if the requested plan cannot be honored.
+
+### QEMU launch builder
+
+- QEMU launch is now described by a declarative `QemuCommand` struct:
+  - `binary: String`
+  - `args: Vec<String>`
+  - `qmp_path: String`
+- `QemuCommandBuilder` is responsible for:
+  - Pre-args (`qemu.pre_args`).
+  - Core args: `-enable-kvm`, `-cpu`, `-smp`, `-m`, and optional hugepage wiring (`-mem-prealloc -mem-path /dev/hugepages`).
+  - Machine and firmware: `-machine q35,accel=kvm` and the OVMF pflash drives.
+  - QMP socket: `-qmp unix:/run/chalybs/<vm>.qmp,server,nowait`.
+  - RTC and SMBIOS via dedicated helpers that mirror the legacy behavior.
+  - vfio-pci device wiring, including PCIe root-port mapping and optional `rombar=0`.
+  - Mid-args (`qemu.args`) and post-args (`qemu.post_args`).
+- The `launch()` function now:
+  - Converts `QemuCommand` into a `std::process::Command` without re-implementing the argument logic.
+  - Spawns the QEMU child, logs the PID and QMP path, and moves the process into the VM cpuset when configured.
+
+### Deterministic PCIe root-port mapping
+
+- A deterministic allocator computes a `bdf -> 0xNN` map for all passthrough devices:
+  - All configured devices under `vm.devices.{gpu,nvme,nic,usb}` participate.
+  - Ordering is stable by kind (GPU, NVMe, NIC, USB) and then lexicographically by BDF.
+  - Slots are auto-assigned from `0x01` upward, skipping any explicitly claimed by `qemu.pci_rootport`.
+- Configuration validation:
+  - Overrides must reference BDFs that actually appear in the VM's passthrough set.
+  - Addresses must be of the form `0xNN` with `NN ∈ [00,1f]`.
+  - Duplicate slots across devices are rejected.
+- The allocator is used consistently for both GPUs and non-GPU vfio devices so that PCI topology in the guest is stable and predictable.
+
+### RTC & SMBIOS
+
+- RTC behavior is now fully centralized:
+  - `Some(non-empty)` → `-rtc <value>` exactly as given.
+  - `Some(empty/whitespace)` → omit `-rtc` entirely, letting QEMU default.
+  - `None` → emit the historic `-rtc base=localtime,driftfix=slew` used by the Bash suite for Windows guests.
+- SMBIOS arguments are constructed from the `qemu.smbios` section when present:
+  - Type 0 (BIOS), type 1 (system), and type 2 (baseboard) are each emitted only when at least one non-empty field is present.
+  - This preserves legacy semantics while making the behavior explicit and testable.
+
+### Upgrade notes
+
+- Existing configs that did not specify `qemu.cpu_model` continue to behave as before.
+- Configs that set `qemu.cpu_model = "auto"` now benefit from the dedicated CPU detection path, but will still fall back to `-cpu host` on unsupported hardware.
+- Any invalid `qemu.pci_rootport` configuration that previously slipped by will now fail the VM start with a clear error; this is intentional and aligned with Chalybs' philosophy of failing loudly and deterministically.
+

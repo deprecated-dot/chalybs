@@ -4,6 +4,7 @@ use std::process::Child;
 use serde::Serialize;
 
 use crate::config::VmConfig;
+use crate::cpuplan::CpuPlan;
 
 /// Core-level event kind for VM-specific lifecycle activity.
 ///
@@ -109,6 +110,17 @@ pub struct VmRuntime {
     pub hugepages_bytes: u64,
     pub hugepages_active: bool,
 
+    /// Immutable, validated CPU plan for this VM, if available.
+    ///
+    /// This is constructed during the Validate phase from:
+    ///   - host CPUID identity
+    ///   - host NUMA topology
+    ///   - VM CPU layout (host/vm sets)
+    ///
+    /// and is used by current and future validation layers to enforce
+    /// NUMA/CPU invariants deterministically.
+    pub cpu_plan: Option<CpuPlan>,
+
     /// Best-known Tasmota relay state for this VM.
     ///
     /// This is updated by the Tasmota peripheral hook based on the
@@ -133,6 +145,7 @@ impl VmRuntime {
             hugepages_pages: 0,
             hugepages_bytes: 0,
             hugepages_active: false,
+            cpu_plan: None,
             tasmota_powered: Cell::new(false),
         }
     }
