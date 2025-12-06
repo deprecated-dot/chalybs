@@ -199,3 +199,33 @@ v1.2.2 checkpoint (2025-12-03)
 
 - Completed: Deterministic PCI slot allocator, GPU arg logic.
 - Next: Additional feature phases.
+
+## v1.3.x – CPU planner & QEMU determinism (snapshot as of v1.3.5)
+
+Status: **Partially complete – core work landed in v1.3.5**
+
+### Completed in v1.3.5
+
+- Host CPU detection and QEMU CPU model mapping:
+  - `cpu::detect` derives a concrete `CpuIdentity` from the host.
+  - A deterministic mapping selects a supported QEMU CPU model string (e.g. `EPYC-v2`).
+- NUMA-aware CPU planning:
+  - `HostNumaTopology` is discovered from sysfs and logged explicitly.
+  - A new `CpuPlan` layer validates that vCPU assignment, NUMA node selection, cpusets, and hugepage placement are coherent.
+  - Validation is wired into the existing `Validate` / `ReserveCpus` phases and fails hard on inconsistency.
+- QEMU launch command builder:
+  - `QemuCommand` + `QemuCommandBuilder` now own QEMU argument construction end-to-end.
+  - RTC, SMBIOS, hugepages, firmware, QMP, and vfio device wiring are all driven through the builder.
+  - Deterministic PCIe root-port allocation (`qemu.pci_rootport` + auto-assignment) is integrated into the QEMU launch path.
+
+### Remaining / follow-ups
+
+- Add focused unit and integration tests for:
+  - CPU detection / QEMU model mapping on additional host SKUs.
+  - CpuPlan validation edge cases (oversubscription, misaligned NUMA, invalid cpuset layouts).
+  - QemuCommandBuilder argument ordering, especially around `pre_args`, mid-args, and `post_args`.
+- Extend the architecture docs and TUI introspection views to surface:
+  - The resolved QEMU CPU model for each VM.
+  - The effective CPU plan (vCPU → host CPU, NUMA node).
+  - The final QEMU command line for debugging and regression checks.
+

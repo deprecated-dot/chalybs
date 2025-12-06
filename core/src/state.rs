@@ -1,5 +1,6 @@
 use tracing::{info, instrument};
 
+use crate::cpuplan::{build_cpu_plan, validate_cpu_plan, CpuPlanInputs, CpuPlanValidationError};
 use crate::errors::{ChalybsError, Result};
 use crate::model::VmRuntime;
 
@@ -72,18 +73,106 @@ impl VmStateMachine {
                     .push_info("qemu: preflight checks completed successfully");
 
                 // PCI / GPU policy preflight
-                //
-                // NOTE: policy lives under config::pci (consuming the
-                // crate::pci inventory module), so the correct path is:
-                //   crate::config::pci::preflight_gpu_policy(...)
                 crate::config::pci::preflight_gpu_policy(&self.rt.name, &self.rt.cfg)?;
                 self.rt
                     .push_info("pci: GPU policy preflight completed successfully");
 
+                // -----------------------------------------------------------------
+                // CPU plan construction + structural validation (Option B: hard error)
+                //
+                // This is the point where we fold:
+                //   - host CPU identity (CPUID)
+                //   - host NUMA topology (sysfs)
+                //   - VM CPU layout (config)
+                //
+                // into a CpuPlan and *require* structural consistency.
+                //
+                // Semantics:
+                //   - If CPUID or NUMA topology cannot be obtained at all
+                //     (e.g. non-x86 host, missing sysfs), we log and proceed
+                //     without a CpuPlan (cpu_plan remains None).
+                //   - If a CpuPlan *can* be built but validation yields
+                //     findings, we treat that as a deterministic configuration
+                //     error and abort bring-up here.
+                // -----------------------------------------------------------------
+
+                // 1) Host CPU identity via CPUID (detect layer).
+                if let Some(ident) = crate::cpu::detect::detect_cpu_identity() {
+                    let arch = crate::cpu::detect::classify_cpu(&ident);
+
+                    // 2) NUMA topology from sysfs.
+                    match crate::cpu::detect::HostNumaTopology::from_sysfs() {
+                        Ok(topo) => {
+                            // 3) Build an immutable CpuPlan.
+                            let inputs = CpuPlanInputs::new(
+                                ident.clone(),
+                                arch,
+                                topo.clone(),
+                                self.rt.cpus.clone(),
+                            );
+                            let plan = build_cpu_plan(inputs);
+
+                            // 4) Validate the plan structurally.
+                            let findings = validate_cpu_plan(&plan);
+
+                            if !findings.is_empty() {
+                                // Hard-error semantics: convert findings into a
+                                // deterministic error and abort bring-up.
+                                let mut msgs = Vec::new();
+
+                                for f in &findings {
+                                    match f {
+                                        CpuPlanValidationError::HostCpuOutsideTopology { cpu } => {
+                                            msgs.push(format!(
+                                                "host CPU {} listed in host_cpus is not present \
+                                                 in any discovered NUMA node",
+                                                cpu
+                                            ));
+                                        }
+                                        CpuPlanValidationError::VmCpuOutsideTopology { cpu } => {
+                                            msgs.push(format!(
+                                                "VM CPU {} listed in vm_cpus is not present in \
+                                                 any discovered NUMA node",
+                                                cpu
+                                            ));
+                                        }
+                                    }
+                                }
+
+                                let msg = format!(
+                                    "cpuplan: structural CPU plan validation failed; VM bring-up \
+                                     aborted. Findings: {}",
+                                    msgs.join("; ")
+                                );
+
+                                self.rt.push_error(msg.clone());
+                                return Err(ChalybsError::State(msg));
+                            }
+
+                            // No findings: record the plan and continue.
+                            self.rt.cpu_plan = Some(plan);
+                            self.rt.push_info(
+                                "cpuplan: host CPU identity, NUMA topology, and VM CPU layout \
+                                 validated successfully",
+                            );
+                        }
+                        Err(e) => {
+                            // Topology unavailable: log and proceed without CpuPlan.
+                            self.rt.push_warning(format!(
+                                "cpuplan: failed to read host NUMA topology from sysfs; \
+                                 skipping CPU plan construction for this VM: {e}"
+                            ));
+                        }
+                    }
+                } else {
+                    // CPUID unavailable (e.g. non-x86 host): log and proceed without CpuPlan.
+                    self.rt.push_warning(
+                        "cpuplan: host CPU identity could not be detected via CPUID; \
+                         skipping CPU plan construction for this VM",
+                    );
+                }
+
                 // First writey phase: hugepage provisioning.
-                // This is intentionally placed before any VFIO or cpuset
-                // mutations so that hugepage failures fail-fast without
-                // leaving partially staged devices or cpusets behind.
                 self.state = VmState::PrepareHugepages;
             }
 
@@ -92,18 +181,6 @@ impl VmStateMachine {
                 self.rt.push_system("state=PrepareHugepages");
 
                 // Phase 12: deterministic hugepage provisioning.
-                //
-                // Behavior:
-                //   - If qemu.hugepages = false → no-op (logs and returns Ok).
-                //   - Otherwise:
-                //       * pick NUMA node (config / topology)
-                //       * compute required 2MiB pages from mem_mb
-                //       * write node-local nr_hugepages
-                //       * record outcome in VmRuntime.{hugepages_*}
-                //
-                // Semantics mirror the existing Bash suite; no QEMU CLI
-                // changes are made here. QEMU flags remain under operator
-                // control via vm.qemu.args/post_args.
                 crate::hugepages::provision_for_vm(&mut self.rt)?;
 
                 self.state = VmState::PreparePci;
@@ -113,15 +190,6 @@ impl VmStateMachine {
                 info!("state=PreparePci");
                 self.rt.push_system("state=PreparePci");
 
-                // Phase 5–7: perform VFIO staging for all PCI devices
-                // that this VM wants to passthrough. This builds a VFIO
-                // action plan and executes it (unbind current drivers,
-                // bind to vfio-pci), recording original driver bindings
-                // in VmRuntime for later restoration at shutdown.
-                //
-                // All safety policy is enforced earlier (e.g. single-GPU
-                // checks, unbind feasibility). Any failure here aborts
-                // before QEMU launch.
                 crate::vfio::stage_pci_devices_for_vm(&mut self.rt)?;
                 self.rt
                     .push_info("vfio: PCI staging completed for VM passthrough devices");
@@ -133,10 +201,6 @@ impl VmStateMachine {
                 info!("state=ReserveCpus");
                 self.rt.push_system("state=ReserveCpus");
 
-                // Phase 10 (CPU): reserve CPUs and create cpuset hierarchy.
-                // This is now routed through the Phase 10 CPU orchestrator
-                // to keep state-machine call sites stable as CPU handling
-                // evolves.
                 crate::cpu::reserve_cpus(&mut self.rt)?;
                 self.rt
                     .push_info("cpuset: VM/host cpuset hierarchy created");
@@ -154,8 +218,6 @@ impl VmStateMachine {
                     self.rt
                         .push_info(format!("qemu: launched with pid {}", qemu.pid));
                 } else {
-                    // This should not normally happen; log as a semantic error
-                    // without changing control flow.
                     self.rt
                         .push_warning("qemu: launch completed but QemuState pid not recorded");
                 }
@@ -167,7 +229,6 @@ impl VmStateMachine {
                 info!("state=DetectThreads");
                 self.rt.push_system("state=DetectThreads");
 
-                // Phase 10 (CPU): wait for QEMU threads via orchestrator.
                 crate::cpu::wait_for_qemu_threads(&self.rt)?;
                 self.rt
                     .push_info("affinity: QEMU threads discovered for pinning");
@@ -179,7 +240,6 @@ impl VmStateMachine {
                 info!("state=PinVcpus");
                 self.rt.push_system("state=PinVcpus");
 
-                // Phase 10 (CPU): pin vCPU threads via orchestrator.
                 crate::cpu::pin_vcpus(&self.rt)?;
                 self.rt.pinned_threads = true;
                 self.rt
@@ -192,9 +252,6 @@ impl VmStateMachine {
                 info!("state=DetectMsi");
                 self.rt.push_system("state=DetectMsi");
 
-                // Phase 11 (IRQ): spawn background worker that will
-                // deterministically hook MSI/MSI-X once the guest driver
-                // brings them up, without blocking VM bring-up here.
                 crate::irq::spawn_irq_pin_worker(&self.rt)?;
                 self.rt.push_info(
                     "irq: background worker spawned for MSI/MSI-X detection and IRQ pinning",
@@ -207,10 +264,6 @@ impl VmStateMachine {
                 info!("state=PinIrqs");
                 self.rt.push_system("state=PinIrqs");
 
-                // IRQ pinning itself is now handled asynchronously by the
-                // worker started in DetectMsi. From the state machine's
-                // perspective, pinning has been requested and we can
-                // proceed with the remaining bring-up.
                 self.rt.pinned_irqs = true;
                 self.rt
                     .push_info("irq: IRQ pinning delegated to background worker");
@@ -230,15 +283,12 @@ impl VmStateMachine {
             }
 
             VmState::Steady => {
-                // Idempotent: nothing further to do on bring-up.
                 info!("VM already in steady-state");
                 self.rt.push_system("state=Steady");
                 self.rt
                     .push_info("vm: already in steady-state (all bring-up phases complete)");
             }
 
-            // Shutdown / Cleanup / Idle are not valid targets for the
-            // bring-up `step()` path.
             s @ VmState::Shutdown | s @ VmState::Cleanup | s @ VmState::Idle => {
                 return Err(ChalybsError::State(format!(
                     "step() called in invalid bring-up state: {s:?}"
@@ -253,11 +303,6 @@ impl VmStateMachine {
     // Backwards-compatible blocking bring-up
     // ---------------------------------------------------------------------
 
-    /// Blocking wrapper: advance the VM through all bring-up states
-    /// until it reaches `Steady` or an error occurs.
-    ///
-    /// This preserves the original synchronous semantics while internally
-    /// using the segmented `step()` API.
     #[instrument(skip_all, fields(vm = %self.rt.name))]
     pub fn run_until_steady(&mut self) -> Result<()> {
         loop {
@@ -286,19 +331,9 @@ impl VmStateMachine {
     // Segmented shutdown: one step towards Idle
     // ---------------------------------------------------------------------
 
-    /// Advance the shutdown sequence by at most one step towards `Idle`.
-    ///
-    /// Semantics:
-    ///   - From Steady / PinIrqs / PeripheralHooks → enter Shutdown
-    ///   - In Shutdown → request QEMU shutdown, then transition to Cleanup
-    ///   - In Cleanup  → restore PCI drivers + destroy cpusets → Idle
-    ///   - In Idle     → no-op
-    ///
-    /// Returns the new state after this step.
     #[instrument(skip_all, fields(vm = %self.rt.name))]
     pub fn step_shutdown(&mut self) -> Result<VmState> {
         match self.state {
-            // If we’re in Steady or close to it, transition into Shutdown.
             VmState::Steady | VmState::PinIrqs | VmState::PeripheralHooks => {
                 info!("state=Shutdown");
                 self.rt.push_system("state=Shutdown");
@@ -307,15 +342,10 @@ impl VmStateMachine {
                 self.rt
                     .push_info("qemu: shutdown requested for VM instance");
 
-                // After requesting shutdown, we model the next step as
-                // Shutdown (restore PCI + cpuset cleanup in next arm).
                 self.state = VmState::Shutdown;
             }
 
             VmState::Shutdown => {
-                // Phase 7: restore PCI driver bindings for all devices that were
-                // staged to vfio-pci for this VM. This is best-effort: failures
-                // are logged but do not abort shutdown.
                 info!("state=RestorePci");
                 self.rt
                     .push_system("state=RestorePci (restore PCI driver bindings)");
@@ -326,17 +356,14 @@ impl VmStateMachine {
                 info!("state=Cleanup");
                 self.rt.push_system("state=Cleanup");
 
-                // Phase 10 (CPU): cleanup cpuset hierarchy via orchestrator.
                 crate::cpu::cleanup_cpus(&mut self.rt)?;
                 self.rt
                     .push_info("cpuset: VM/host cpuset hierarchy cleaned up");
 
-                // Phase 12: hugepage teardown (best-effort).
                 crate::hugepages::cleanup_for_vm(&mut self.rt)?;
                 self.rt
                     .push_info("hugepages: teardown completed for VM instance");
 
-                // Phase 14: peripheral VM-down hooks (Tasmota, etc.)
                 crate::peripherals::apply_vm_down(&mut self.rt)?;
                 self.rt
                     .push_info("peripherals: VM down hooks applied successfully");
@@ -345,22 +372,17 @@ impl VmStateMachine {
             }
 
             VmState::Cleanup => {
-                // Final transition to Idle; no additional work beyond what was
-                // done in the previous Cleanup step.
                 self.state = VmState::Idle;
                 self.rt
                     .push_system("state=Idle (VM shutdown sequence completed)");
             }
 
             VmState::Idle => {
-                // Idempotent: already fully shut down.
                 info!("VM already in Idle; shutdown step is a no-op");
                 self.rt
                     .push_system("state=Idle (shutdown already completed)");
             }
 
-            // For earlier bring-up states, we attempt a best-effort shutdown by
-            // transitioning into Shutdown and performing the QEMU shutdown path.
             other => {
                 info!("state=Shutdown (from {:?})", other);
                 self.rt
@@ -381,17 +403,11 @@ impl VmStateMachine {
     // Backwards-compatible blocking shutdown
     // ---------------------------------------------------------------------
 
-    /// Blocking wrapper: advance the VM through shutdown until it
-    /// reaches `Idle` or an error occurs.
-    ///
-    /// This preserves the original synchronous semantics while internally
-    /// using the segmented `step_shutdown()` API.
     #[instrument(skip_all, fields(vm = %self.rt.name))]
     pub fn run_shutdown(&mut self) -> Result<()> {
         loop {
             match self.state {
                 VmState::Idle => {
-                    // Already fully shut down.
                     return Ok(());
                 }
                 _ => {

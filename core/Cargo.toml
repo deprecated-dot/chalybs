@@ -34,3 +34,6 @@ reqwest.workspace = true
 urlencoding.workspace = true
 libc = "0.2"
 rumqttc = "0.25"
+
+# --- Added for CPUID-based CPU identification (x86/x86_64 only) ---
+raw-cpuid = "11"

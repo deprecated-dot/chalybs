@@ -15,6 +15,8 @@
 //!     CPU affinity "plans" and restore summaries (Phase 10+), without
 //!     touching the state machine again.
 
+pub mod detect;
+
 use crate::errors::Result;
 use crate::model::VmRuntime;
 

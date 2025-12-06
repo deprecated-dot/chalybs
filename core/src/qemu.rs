@@ -44,76 +44,166 @@ fn qmp_path_for_vm(vm_name: &str) -> String {
     format!("/run/chalybs/{vm_name}.qmp")
 }
 
-/// Attempt to auto-detect a suitable QEMU CPU model string (-cpu <model>)
-/// from the host's /proc/cpuinfo.
+/// Declarative description of a QEMU command.
 ///
-/// This is deliberately conservative and *opt-in*:
-///   - Currently handles x86_64 AMD (AuthenticAMD) family >= 0x17, where
-///     using "EPYC-v2" is a safe, well-tested baseline for Zen/Zen+/Zen2-
-///     class hardware on your fleet.
-///   - For everything else, returns None and the caller must fall back
-///     to "host" or whatever the config explicitly requested.
+/// This is deliberately "dumb data": the builder fills it, and the
+/// launch() path is responsible for translating it into a std::process::Command.
+#[derive(Debug)]
+struct QemuCommand {
+    binary: String,
+    args: Vec<String>,
+    qmp_path: String,
+}
+
+/// Builder for QemuCommand.
 ///
-/// This keeps existing behavior intact and avoids surprising regressions
-/// on non-AMD or very old hardware. Future work can extend this to Intel
-/// and newer AMD generations in a table-driven way.
-fn autodetect_qemu_cpu_model() -> Option<String> {
-    let contents = fs::read_to_string("/proc/cpuinfo").ok()?;
+/// This folds all existing QEMU launch semantics into a structured
+/// command model without altering behavior.
+struct QemuCommandBuilder<'a> {
+    rt: &'a VmRuntime,
+    binary: String,
+    args: Vec<String>,
+    qmp_path: String,
+}
 
-    let mut vendor_id: Option<String> = None;
-    let mut family: Option<u32> = None;
+impl<'a> QemuCommandBuilder<'a> {
+    fn new(rt: &'a VmRuntime) -> Self {
+        let q = &rt.cfg.qemu;
+        let binary = q.binary.clone();
+        let qmp_path = qmp_path_for_vm(&rt.name);
 
-    for line in contents.lines() {
-        let line = line.trim();
-
-        if line.starts_with("vendor_id") {
-            if let Some((_, v)) = line.split_once(':') {
-                vendor_id = Some(v.trim().to_string());
-            }
-        } else if line.starts_with("cpu family") {
-            if let Some((_, v)) = line.split_once(':') {
-                if let Ok(val) = v.trim().parse::<u32>() {
-                    family = Some(val);
-                }
-            }
-        }
-
-        if vendor_id.is_some() && family.is_some() {
-            break;
+        Self {
+            rt,
+            binary,
+            args: Vec::new(),
+            qmp_path,
         }
     }
 
-    let vendor = vendor_id?;
-    let family = family?;
+    /// 1) Pre-arguments from config (inserted before core args).
+    fn apply_pre_args(&mut self) {
+        let q = &self.rt.cfg.qemu;
 
-    if vendor == "AuthenticAMD" && family >= 0x17 {
-        // Zen and newer (Naples / Threadripper / Ryzen and up).
-        // EPYC-v2 is a known-good baseline on your current fleet.
-        info!(
-            vendor = %vendor,
-            family = family,
-            model = "EPYC-v2",
-            "qemu: auto-detected AMD host, choosing EPYC-v2 CPU model"
-        );
-        Some("EPYC-v2".to_string())
-    } else {
-        info!(
-            vendor = %vendor,
-            family = family,
-            "qemu: CPU autodetect has no mapping for this host; falling back to 'host'"
-        );
-        None
+        if let Some(pre) = q.pre_args.as_ref() {
+            for tok in pre.split_whitespace() {
+                if !tok.is_empty() {
+                    self.args.push(tok.to_string());
+                }
+            }
+        }
+    }
+
+    /// 2) Core Chalybs-managed arguments (-enable-kvm, -cpu, -smp, -m, hugepages).
+    fn apply_core_args(&mut self) {
+        let q = &self.rt.cfg.qemu;
+
+        let cpu_arg = build_cpu_arg(self.rt);
+
+        self.args.push("-enable-kvm".to_string());
+        self.args.push("-cpu".to_string());
+        self.args.push(cpu_arg);
+        self.args.push("-smp".to_string());
+        self.args.push(q.num_vcpus.to_string());
+        self.args.push("-m".to_string());
+        self.args.push(q.mem_mb.to_string());
+
+        // If hugepages are active for this VM, direct QEMU to allocate
+        // RAM from the hugetlbfs mount that Phase 12 provisioned.
+        if self.rt.hugepages_active {
+            info!(
+                vm = %self.rt.name,
+                node = ?self.rt.hugepages_node,
+                pages = self.rt.hugepages_pages,
+                bytes = self.rt.hugepages_bytes,
+                "qemu: using hugepages-backed RAM via hugetlbfs"
+            );
+            self.args.push("-mem-prealloc".to_string());
+            self.args.push("-mem-path".to_string());
+            self.args.push("/dev/hugepages".to_string());
+        }
+    }
+
+    /// 3) Machine type, firmware drives, and QMP socket.
+    fn apply_machine_and_firmware(&mut self) {
+        let q = &self.rt.cfg.qemu;
+
+        self.args.push("-machine".to_string());
+        self.args.push("q35,accel=kvm".to_string());
+
+        self.args.push("-drive".to_string());
+        self.args.push(format!(
+            "if=pflash,format=raw,readonly=on,file={}",
+            q.ovmf_code
+        ));
+
+        self.args.push("-drive".to_string());
+        self.args
+            .push(format!("if=pflash,format=raw,file={}", q.ovmf_vars));
+
+        self.args.push("-qmp".to_string());
+        self.args
+            .push(format!("unix:{},server,nowait", self.qmp_path));
+    }
+
+    /// 4) RTC configuration.
+    fn apply_rtc(&mut self) {
+        apply_rtc_args(&mut self.args, self.rt);
+    }
+
+    /// 5) SMBIOS configuration.
+    fn apply_smbios(&mut self) {
+        apply_smbios_args(&mut self.args, self.rt);
+    }
+
+    /// 6) VFIO PCI devices.
+    fn apply_vfio_pci_devices(&mut self) -> Result<()> {
+        add_vfio_pci_devices(&mut self.args, self.rt)
+    }
+
+    /// 7) Mid-section extra args (`q.args`).
+    fn apply_mid_args(&mut self) {
+        let q = &self.rt.cfg.qemu;
+
+        if !q.args.trim().is_empty() {
+            for tok in q.args.split_whitespace() {
+                if !tok.is_empty() {
+                    self.args.push(tok.to_string());
+                }
+            }
+        }
+    }
+
+    /// 8) Post-arguments (`q.post_args`).
+    fn apply_post_args(&mut self) {
+        let q = &self.rt.cfg.qemu;
+
+        if let Some(post) = q.post_args.as_ref() {
+            for tok in post.split_whitespace() {
+                if !tok.is_empty() {
+                    self.args.push(tok.to_string());
+                }
+            }
+        }
+    }
+
+    fn build(self) -> QemuCommand {
+        QemuCommand {
+            binary: self.binary,
+            args: self.args,
+            qmp_path: self.qmp_path,
+        }
     }
 }
 
 /// Build the QEMU -cpu argument from config:
 ///
 ///   1. If `q.cpu_model` is Some:
-///        - If it is the literal string "auto" (case-insensitive), attempt a
-///          conservative autodetect from /proc/cpuinfo. On failure, fall back
-///          to "host".
-///        - If it is any other non-empty value, use it as the base model
-///          string verbatim.
+///        - If it is the literal string "auto" (case-insensitive), invoke the
+///          host CPU detection subsystem (`crate::cpu::detect`). If detection
+///          returns a supported model string, use it. Otherwise fall back to
+///          "host".
+///        - If it is any other non-empty value, use it verbatim as the base
+///          model string.
 ///   2. Otherwise, if `cpu_extras` is present:
 ///        - Use `cpu_extras.abi` as the base model if non-empty,
 ///          otherwise fall back to "host".
@@ -124,11 +214,13 @@ fn autodetect_qemu_cpu_model() -> Option<String> {
 /// skipping any empty components.
 ///
 /// This means:
-///   - You can set `cpu_model = "auto"` to get autodetection *and* still
-///     supply `topo`, `hv_contexts`, and `vendor_id` via `cpu_extras`.
-///   - You can pin an explicit model via `cpu_model = "EPYC-v2"` (or similar)
-///     and still keep the extra flags.
-///   - Legacy configs without `cpu_model` behave as before.
+///   - You can set `cpu_model = "auto"` to use the dedicated CPU detection
+///     subsystem *and* still provide `topo`, `hv_contexts`, and `vendor_id`
+///     via `cpu_extras`.
+///   - You can specify an explicit model such as `cpu_model = "EPYC-v2"`
+///     and still have extras applied.
+///   - Legacy configurations without `cpu_model` maintain their previous
+///     semantics.
 fn build_cpu_arg(rt: &VmRuntime) -> String {
     let q = &rt.cfg.qemu;
 
@@ -140,7 +232,7 @@ fn build_cpu_arg(rt: &VmRuntime) -> String {
         .filter(|s| !s.is_empty())
     {
         if raw_model.eq_ignore_ascii_case("auto") {
-            match autodetect_qemu_cpu_model() {
+            match crate::cpu::detect::autodetect_qemu_cpu_model() {
                 Some(model) => model,
                 None => {
                     info!(
@@ -193,8 +285,8 @@ fn build_cpu_arg(rt: &VmRuntime) -> String {
     parts.join(",")
 }
 
-/// Inject SMBIOS configuration into the QEMU command (if configured).
-fn apply_smbios_args(cmd: &mut Command, rt: &VmRuntime) {
+/// Inject SMBIOS configuration into the QEMU argument list (if configured).
+fn apply_smbios_args(args: &mut Vec<String>, rt: &VmRuntime) {
     let q = &rt.cfg.qemu;
     let Some(smb) = &q.smbios else {
         return;
@@ -218,8 +310,8 @@ fn apply_smbios_args(cmd: &mut Command, rt: &VmRuntime) {
         }
     }
     if !t0_parts.is_empty() {
-        cmd.arg("-smbios")
-            .arg(format!("type=0,{}", t0_parts.join(",")));
+        args.push("-smbios".to_string());
+        args.push(format!("type=0,{}", t0_parts.join(",")));
     }
 
     // type=1: system
@@ -240,8 +332,8 @@ fn apply_smbios_args(cmd: &mut Command, rt: &VmRuntime) {
         }
     }
     if !t1_parts.is_empty() {
-        cmd.arg("-smbios")
-            .arg(format!("type=1,{}", t1_parts.join(",")));
+        args.push("-smbios".to_string());
+        args.push(format!("type=1,{}", t1_parts.join(",")));
     }
 
     // type=2: baseboard
@@ -257,8 +349,8 @@ fn apply_smbios_args(cmd: &mut Command, rt: &VmRuntime) {
         }
     }
     if !t2_parts.is_empty() {
-        cmd.arg("-smbios")
-            .arg(format!("type=2,{}", t2_parts.join(",")));
+        args.push("-smbios".to_string());
+        args.push(format!("type=2,{}", t2_parts.join(",")));
     }
 }
 
@@ -425,7 +517,7 @@ fn apply_rootport_mapping(params: &mut String, bdf: &str, pci_rootport: &HashMap
 ///   - All passthrough devices are assigned deterministic `bus=pcie.0,addr=`
 ///     values via the internal root-port allocator, with any explicit
 ///     `qemu.pci_rootport` overrides applied first.
-fn add_vfio_pci_devices(cmd: &mut Command, rt: &VmRuntime) -> Result<()> {
+fn add_vfio_pci_devices(args: &mut Vec<String>, rt: &VmRuntime) -> Result<()> {
     let DevicesConfig {
         gpu,
         nvme,
@@ -450,8 +542,7 @@ fn add_vfio_pci_devices(cmd: &mut Command, rt: &VmRuntime) -> Result<()> {
             let mut params = format!("host={}", dev.pci_address);
 
             if idx == 0 && use_legacy_primary_gpu && gpus.len() > 1 {
-                // Legacy behavior for pre-UEFI/GOP GPUs: mark the primary
-                // function as VGA and multifunction when explicitly requested.
+                // Legacy behavior for pre-UEFI/GOP GPUs:
                 params.push_str(",multifunction=on,x-vga=on");
             }
 
@@ -461,7 +552,8 @@ fn add_vfio_pci_devices(cmd: &mut Command, rt: &VmRuntime) -> Result<()> {
 
             apply_rootport_mapping(&mut params, &dev.pci_address, &pci_rootport);
 
-            cmd.arg("-device").arg(format!("vfio-pci,{params}"));
+            args.push("-device".to_string());
+            args.push(format!("vfio-pci,{params}"));
 
             info!(
                 pci = %dev.pci_address,
@@ -473,7 +565,7 @@ fn add_vfio_pci_devices(cmd: &mut Command, rt: &VmRuntime) -> Result<()> {
     // Helper for non-GPU kinds: plain vfio-pci attachment, with optional
     // rombar=0 and deterministic pci_rootport mapping.
     fn add_generic_list(
-        cmd: &mut Command,
+        args: &mut Vec<String>,
         list: &Option<Vec<PciDeviceConfig>>,
         kind: &str,
         rombar_list: &[String],
@@ -489,7 +581,8 @@ fn add_vfio_pci_devices(cmd: &mut Command, rt: &VmRuntime) -> Result<()> {
 
                 apply_rootport_mapping(&mut params, &dev.pci_address, pci_rootport);
 
-                cmd.arg("-device").arg(format!("vfio-pci,{params}"));
+                args.push("-device".to_string());
+                args.push(format!("vfio-pci,{params}"));
 
                 info!(
                     pci = %dev.pci_address,
@@ -502,9 +595,9 @@ fn add_vfio_pci_devices(cmd: &mut Command, rt: &VmRuntime) -> Result<()> {
         Ok(())
     }
 
-    add_generic_list(cmd, nvme, "NVMe", rombar_list, &pci_rootport)?;
-    add_generic_list(cmd, nic, "NIC", rombar_list, &pci_rootport)?;
-    add_generic_list(cmd, usb, "USB", rombar_list, &pci_rootport)?;
+    add_generic_list(args, nvme, "NVMe", rombar_list, &pci_rootport)?;
+    add_generic_list(args, nic, "NIC", rombar_list, &pci_rootport)?;
+    add_generic_list(args, usb, "USB", rombar_list, &pci_rootport)?;
 
     Ok(())
 }
@@ -516,18 +609,20 @@ fn add_vfio_pci_devices(cmd: &mut Command, rt: &VmRuntime) -> Result<()> {
 ///   - If q.rtc = Some("") (empty/whitespace), emit nothing (QEMU default)
 ///   - If q.rtc = None, emit the legacy Bash default:
 ///       `-rtc base=localtime,driftfix=slew`
-fn apply_rtc_args(cmd: &mut Command, rt: &VmRuntime) {
+fn apply_rtc_args(args: &mut Vec<String>, rt: &VmRuntime) {
     let q = &rt.cfg.qemu;
 
     match q.rtc.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(val) => {
-            cmd.arg("-rtc").arg(val);
+            args.push("-rtc".to_string());
+            args.push(val.to_string());
             info!(rtc = %val, "qemu: using explicit RTC policy from config");
         }
         None => {
             // Default: mirror Bash suite behavior for Windows guests.
             let default_rtc = "base=localtime,driftfix=slew";
-            cmd.arg("-rtc").arg(default_rtc);
+            args.push("-rtc".to_string());
+            args.push(default_rtc.to_string());
             info!(
                 rtc = %default_rtc,
                 "qemu: using default RTC policy (localtime + driftfix)"
@@ -538,99 +633,39 @@ fn apply_rtc_args(cmd: &mut Command, rt: &VmRuntime) {
 
 /// Launch QEMU and move it into the vm cpuset.
 pub fn launch(rt: &mut VmRuntime) -> Result<()> {
-    let q = &rt.cfg.qemu;
     let vm_name = &rt.name;
 
     // Ensure /run/chalybs exists for QMP sockets, etc.
     fs::create_dir_all("/run/chalybs")
         .map_err(|e| ChalybsError::Qemu(format!("failed to create /run/chalybs: {e}")))?;
 
-    let qmp_path = qmp_path_for_vm(vm_name);
+    // Declarative command construction via builder.
+    let mut builder = QemuCommandBuilder::new(rt);
+    builder.apply_pre_args();
+    builder.apply_core_args();
+    builder.apply_machine_and_firmware();
+    builder.apply_rtc();
+    builder.apply_smbios();
+    builder.apply_vfio_pci_devices()?;
+    builder.apply_mid_args();
+    builder.apply_post_args();
 
-    let mut cmd = Command::new(&q.binary);
+    let cmd_desc = builder.build();
 
-    // 1) Pre-arguments from config (inserted before core args).
-    if let Some(pre) = q.pre_args.as_ref() {
-        for tok in pre.split_whitespace() {
-            if !tok.is_empty() {
-                cmd.arg(tok);
-            }
-        }
-    }
+    debug!(
+        binary = %cmd_desc.binary,
+        args = ?cmd_desc.args,
+        "launching QEMU"
+    );
 
-    // 2) Core Chalybs-managed arguments.
-    let cpu_arg = build_cpu_arg(rt);
-
-    cmd.arg("-enable-kvm")
-        .arg("-cpu")
-        .arg(cpu_arg)
-        .arg("-smp")
-        .arg(q.num_vcpus.to_string())
-        .arg("-m")
-        .arg(q.mem_mb.to_string());
-
-    // If hugepages are active for this VM, direct QEMU to allocate
-    // RAM from the hugetlbfs mount that Phase 12 provisioned.
-    // This is the only behavior change here: we do not alter mem_mb,
-    // topology, or device wiring.
-    if rt.hugepages_active {
-        info!(
-            vm = %rt.name,
-            node = ?rt.hugepages_node,
-            pages = rt.hugepages_pages,
-            bytes = rt.hugepages_bytes,
-            "qemu: using hugepages-backed RAM via hugetlbfs"
-        );
-        cmd.arg("-mem-prealloc")
-            .arg("-mem-path")
-            .arg("/dev/hugepages");
-    }
-
-    cmd.arg("-machine")
-        .arg("q35,accel=kvm")
-        .arg("-drive")
-        .arg(format!(
-            "if=pflash,format=raw,readonly=on,file={}",
-            q.ovmf_code
-        ))
-        .arg("-drive")
-        .arg(format!("if=pflash,format=raw,file={}", q.ovmf_vars))
-        // QMP socket for deterministic vCPU discovery.
-        .arg("-qmp")
-        .arg(format!("unix:{},server,nowait", qmp_path));
-
-    // 3) RTC configuration (mirrors legacy Bash default unless overridden).
-    apply_rtc_args(&mut cmd, rt);
-
-    // 4) SMBIOS configuration (if any).
-    apply_smbios_args(&mut cmd, rt);
-
-    // 5) VFIO PCI devices from VmConfig (GPU, NVMe, NIC, USB).
-    add_vfio_pci_devices(&mut cmd, rt)?;
-
-    // 6) Mid-section extra args (historical `args` field).
-    if !q.args.trim().is_empty() {
-        for tok in q.args.split_whitespace() {
-            if !tok.is_empty() {
-                cmd.arg(tok);
-            }
-        }
-    }
-
-    // 7) Post-arguments (final overrides).
-    if let Some(post) = q.post_args.as_ref() {
-        for tok in post.split_whitespace() {
-            if !tok.is_empty() {
-                cmd.arg(tok);
-            }
-        }
+    let mut cmd = Command::new(&cmd_desc.binary);
+    for arg in &cmd_desc.args {
+        cmd.arg(arg);
     }
 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-
-    debug!("launching QEMU: {:?}", cmd);
 
     let child = cmd
         .spawn()
@@ -638,9 +673,14 @@ pub fn launch(rt: &mut VmRuntime) -> Result<()> {
 
     let pid = child.id() as i32;
 
-    info!(pid, vm = %vm_name, qmp = %qmp_path, "spawned QEMU process");
+    info!(
+        pid,
+        vm = %vm_name,
+        qmp = %cmd_desc.qmp_path,
+        "spawned QEMU process"
+    );
 
-    // Move QEMU into vm cpuset if configured.
+    // Move QEMU into vm cpuset.
     if let Some(cg) = &rt.cgroups {
         let procs_path = cg.vm.join("cgroup.procs");
         if procs_path.exists() {

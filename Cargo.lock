@@ -245,6 +245,7 @@ dependencies = [
  "libc",
  "nix",
  "procfs",
+ "raw-cpuid",
  "regex",
  "reqwest",
  "rumqttc",
@@ -1332,6 +1333,15 @@ dependencies = [
  "unicode-segmentation",
  "unicode-truncate",
  "unicode-width",
+]
+
+[[package]]
+name = "raw-cpuid"
+version = "11.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
+dependencies = [
+ "bitflags 2.10.0",
 ]
 
 [[package]]
