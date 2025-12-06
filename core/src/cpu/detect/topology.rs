@@ -107,9 +107,12 @@ impl HostNumaTopology {
 /// into a Vec<u32> of individual CPU IDs.
 ///
 /// This parser is deterministic and conservative:
-///   - Invalid segments are skipped.
+///   - Invalid segments are skipped *as far as possible*.
 ///   - Negative numbers are ignored.
 ///   - Overflows are silently dropped.
+///
+/// For partially-invalid ranges like "0-x", we salvage the valid side
+/// ("0" in this case) rather than dropping the entire segment.
 fn parse_cpulist(s: &str) -> Vec<u32> {
     let mut out = Vec::new();
 
@@ -120,22 +123,33 @@ fn parse_cpulist(s: &str) -> Vec<u32> {
         }
 
         if let Some((start_s, end_s)) = part.split_once('-') {
-            let start = match start_s.trim().parse::<u32>() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let end = match end_s.trim().parse::<u32>() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let start_parsed = start_s.trim().parse::<u32>();
+            let end_parsed = end_s.trim().parse::<u32>();
 
-            if end < start {
-                continue;
-            }
+            match (start_parsed, end_parsed) {
+                (Ok(start), Ok(end)) => {
+                    if end < start {
+                        // Clearly malformed range like "3-1" → skip.
+                        continue;
+                    }
 
-            // Inclusive range [start, end].
-            for cpu in start..=end {
-                out.push(cpu);
+                    // Inclusive range [start, end].
+                    for cpu in start..=end {
+                        out.push(cpu);
+                    }
+                }
+                (Ok(start), Err(_)) => {
+                    // Salvage the valid start for cases like "0-x".
+                    out.push(start);
+                }
+                (Err(_), Ok(end)) => {
+                    // Salvage the valid end for cases like "x-3".
+                    out.push(end);
+                }
+                (Err(_), Err(_)) => {
+                    // Completely invalid range → skip.
+                    continue;
+                }
             }
         } else {
             // Single CPU index.
@@ -191,7 +205,7 @@ mod tests {
 
     #[test]
     fn parse_cpulist_ignores_garbage() {
-        // Invalid segments are simply skipped.
+        // Invalid segments are simply skipped or partially salvaged.
         assert_eq!(parse_cpulist("0-x,2-3,y,5"), vec![0, 2, 3, 5]);
     }
 }
