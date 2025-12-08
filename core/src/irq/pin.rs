@@ -507,6 +507,20 @@ fn irq_worker(vm_cpus: Vec<u32>, devices: Vec<PciDeviceConfig>, qemu_pid: i32, v
             device_count = total_devices,
             "irq worker: completed IRQ discovery and pinning for all devices"
         );
+
+        // Deterministic post-IRQ DDC hook:
+        // If a DDC peripheral is configured, switch to the VM input
+        // exactly once, at the moment IRQ pinning is known-complete.
+        if let Some(periph_cfg) = vm_cfg.peripherals {
+            if let Some(ddc_cfg) = periph_cfg.ddc {
+                if let Err(e) = crate::peripherals::ddc::switch_to_vm_input_after_irq(ddc_cfg) {
+                    warn!(
+                        error = %e,
+                        "irq worker: DDC post-IRQ input switch failed"
+                    );
+                }
+            }
+        }
     }
 }
 
