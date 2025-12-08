@@ -1,5 +1,7 @@
 use std::cell::Cell;
 use std::process::Child;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -86,6 +88,13 @@ pub struct VmRuntime {
     pub pinned_threads: bool,
     pub pinned_irqs: bool,
 
+    /// Completion flag for asynchronous IRQ pinning.
+    ///
+    /// This is set to `true` exactly once by the IRQ worker when it has
+    /// successfully discovered and pinned IRQs for all eligible devices.
+    /// It is never reset by core; consumers treat it as a latch.
+    pub irq_pinning_complete: Arc<AtomicBool>,
+
     /// VFIO driver transitions performed while staging PCI devices for
     /// this VM. Used during shutdown to restore original bindings.
     pub vfio_transitions: Vec<VfioTransition>,
@@ -139,6 +148,7 @@ impl VmRuntime {
             qemu: None,
             pinned_threads: false,
             pinned_irqs: false,
+            irq_pinning_complete: Arc::new(AtomicBool::new(false)),
             vfio_transitions: Vec::new(),
             events: Vec::new(),
             hugepages_node: None,

@@ -489,3 +489,38 @@ _Date: 2025-12-06_
   - No `-rtc` argument at all when `qemu.rtc` is explicitly empty/whitespace.
   - Legacy default of `-rtc base=localtime,driftfix=slew` when `qemu.rtc` is `None`.
 
+## v1.4.0 — 2025-12-07
+
+### Added
+- **SPICE peripheral** (`[vm.<name>.peripherals.spice]`)
+  - Deterministic SPICE server wiring in QEMU builder
+  - virtio-serial bus, vdagent channel, and `-spice` invocation
+  - `enabled`, `port`, and `addr` configuration fields
+  - New `SpiceHook` implementing `PeripheralHook`
+
+- **Native DDC client** for monitor input switching over I²C
+  - Eliminates dependence on external tools (ddcutil, shell scripts)
+  - Deterministic bus/feature probing and VCP command emission
+  - Optional `fatal_on_error` behavior
+  - Gated execution after IRQ pinning (Phase 7 → Phase 8 boundary)
+
+- **Looking Glass SHM bring-up and teardown**
+  - Deterministic `/dev/shm/<name>` creation, sizing, permissions, and ownership
+  - Environment-based desktop user discovery (`SUDO_USER → DOAS_USER → USER → LOGNAME`)
+  - Fallback to primary group or `kvm` group when available
+  - Crash-safe deletion of SHM file on `vm_down`
+  - QEMU builder now emits `"memory-backend-file"` + `"ivshmem-plain"` wiring
+
+### Changed
+- `peripherals/mod.rs`:
+  - Now dispatches Tasmota, Looking Glass, and SPICE immediately
+  - Executes DDC only after IRQ pinning is complete
+  - Clone-based extraction avoids borrow checker conflicts
+
+### Fixed
+- Multiple peripheral lifecycle tests updated
+- Majority of DDC test suite corrected; one test (`send_ddc_set_input`) remains pending future work
+
+### Notes
+- No changes to PCI isolation, CPU model resolution, VFIO unbinding, hugepage behavior, IRQ worker, or state machine semantics.
+- This release is fully backwards compatible with all previous VM configurations.

@@ -1,3 +1,85 @@
+# Chalybs v1.4.0 — The SPICE Must Flow
+
+This release introduces three major subsystems while preserving total determinism,
+backwards compatibility, and semantic stability. No heuristics were added anywhere.
+
+---
+
+## 🧬 Native DDC Client (Monitor Input Switching)
+Chalybs now contains its own minimal DDC implementation for switching monitor inputs
+via I²C — eliminating all third-party utilities from the input-switch path.
+
+- Deterministic, synchronous read/write operations
+- Gated on IRQ pinning completion
+- Configurable strictness via `fatal_on_error`
+- No timers, no retries, no polling loops
+
+This also sets the stage for future multi-monitor workflows.
+
+---
+
+## 🪟 Looking Glass: Deterministic SHM Bring-Up
+Looking Glass integration now mirrors (and surpasses) the legacy Bash suite:
+
+- Creates and sizes the SHM file deterministically  
+- Sets mode `0660`
+- Detects the desktop user via stable environment priority  
+- Resolves UID/GID from `/etc/passwd` and group `kvm`
+- Applies `chown` when possible
+- Tears down the SHM file *unconditionally* on VM shutdown  
+- Crash-safe: stale SHM is safely overwritten
+
+QEMU wiring is fully integrated using memory-backend-file + ivshmem.
+
+---
+
+## 🔥 SPICE Peripheral Support
+Chalybs can now expose a SPICE server inside the VM:
+
+```toml
+[vm.myvm.peripherals.spice]
+enabled = true
+port = 5900
+addr  = "127.0.0.1"
+```
+QEMU builder emits:
+
+virtio-serial-pci host
+
+spicevmc chardev
+
+virtserialport vdagent channel
+
+-spice port=...,addr=...,disable-ticketing=on
+
+Perfectly deterministic, portable, and matches historical behavior exactly.
+
+🔧 Other Improvements
+
+Peripheral dispatch order formalized and made borrow-free
+
+Looking Glass and SPICE integrated into lifecycle hooks
+
+Numerous test corrections (1 remains pending: send_ddc_set_input)
+
+🚀 Compatibility & Upgrade Notes
+
+No existing VM configuration files need changes.
+
+All changes are additive and deterministic.
+
+No regressions to PCI, VFIO, isolation policy, or NUMA/hugpage mechanics.
+
+Upgrade is safe for all existing deployments.
+
+🎉 Summary
+
+v1.4.0 meaningfully expands Chalybs’ peripheral and graphics capabilities while
+upholding its central philosophy: deterministic orchestration with zero heuristics.
+
+Party on, dudes.
+
+---
 ## v1.3.0 (2025-12-05)
 
 ### New
