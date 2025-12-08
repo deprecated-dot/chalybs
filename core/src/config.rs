@@ -408,6 +408,7 @@ pub struct PeripheralConfig {
     pub tasmota: Option<TasmotaConfig>,
     pub ddc: Option<DdcConfig>,
     pub looking_glass: Option<LookingGlassConfig>,
+    pub spice: Option<SpiceConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -448,7 +449,28 @@ pub struct DdcConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LookingGlassConfig {
+    /// Shared memory path, typically under /dev/shm, e.g.
+    ///   "/dev/shm/looking-glass"
     pub shm_name: String,
+
+    /// Size of the shared memory region in MiB, e.g. 128.
+    pub mem_mb: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SpiceConfig {
+    /// If true, SPICE wiring is enabled for this VM.
+    ///
+    /// When false (default), no -spice or virtio-serial/vdagent
+    /// devices are added to QEMU for this VM.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// TCP port for the SPICE server, e.g. 5900.
+    pub port: u16,
+
+    /// Bind address for the SPICE server, e.g. "127.0.0.1".
+    pub addr: String,
 }
 
 /// ---------------------------------------------------------------------------

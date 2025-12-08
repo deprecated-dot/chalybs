@@ -1,231 +1,334 @@
-
 # Chalybs ROADMAP
 
-> **Baseline:** v1.1.0  
-> For implemented details, see `CHANGELOG` and architecture docs.
+> Deterministic virtualization for serious systems.
+
+This roadmap is *historical plus forward-looking*:
+- **Past / completed work** is kept for context and marked clearly.
+- **In‑progress** items capture the current development focus.
+- **Planned / future** items sketch out where Chalybs is headed next.
+
+Status legend:
+- ✅ = Complete
+- 🚧 = In progress / partially implemented
+- 🔜 = Planned / near‑term
+- 🧪 = Experimental / research
+- 💤 = Deferred / “someday/maybe”
 
 ---
 
-## 1.1 TUI Baseline (v0.5.0)
+## 0. Foundations & Baseline
 
-- Fully operational text UI with modal overlays
-- Event stream with scrollback + locking
-- Shell panel with history
-- Brand-consistent theming engine
-- Stable UI architecture (ui.rs, app.rs, theme.rs, logo.rs)
-- Mock backend integration online
+### 0.1 Core Principles (anchored, non‑negotiable)
 
-This forms the foundation for all future `chalybsd` interaction.
+✅ **Determinism over heuristics**
+- No polling loops, timers, or “poke‑and‑pray” retry logic.
+- Every external interaction is explicit, ordered, and bounded.
+- Behavior must be reproducible given the same host + config.
 
-## 1.2 Visual Effects & PNG/Halo (v1.0.0 – v1.1.0)
+✅ **Sysfs‑native behavior**
+- Prefer talking directly to `/sys`, `/proc`, and cgroups over shelling out.
+- No hidden dependencies on userland tools where we can reasonably avoid them.
 
-- v1.0.0:
-  - Deterministic TUI visual effects engine (pulse, scanlines, matrix, border
-    noise, badges, logo_reactive, load_index).
-  - Persistent effects configuration via `tui.conf`.
-  - Width-aware VM list layouts and load sparklines.
-- v1.1.0:
-  - Experimental PNG logo renderer for capable terminals.
-  - Set C halo profiles (`c3`, `c3narrow`, `c3wide`, `c3extrawide`) integrated
-    into the TUI via `effects halo`.
-  - Copilot contract + halo bug reference docs added as first-class project
-    artifacts.
+✅ **No config‑breaking surprises**
+- TOML layout is treated as a contract.
+- New behavior is opt‑in, or defaults to “no change” where possible.
+- All behavior changes that can affect existing VMs must be documented and version‑gated.
 
-The long-term goal is a **fully brand-consistent** TUI where ASCII and PNG
-paths feel like two skins over the same architectural core.
+✅ **CPU / NUMA / IRQ awareness**
+- The entire design assumes real multi‑socket, multi‑NUMA Threadripper‑class hosts.
+- Scheduling, pinning, and hugepage placement must respect actual topology.
 
 ---
 
-## 2. Current Core Baseline (v0.4.1)
+## 1. State Machine & Execution Model
 
-- PCI/VFIO Phases 1–9 complete.
-- IsolationMode (Phase 8) + IsolationLevel (Phase 9) both active.
-- Deterministic CPU/IRQ placement (C2 policy).
-- Complete internal synchronization of VFIO plan → execute → verify → restore → isolate.
-- Documentation refreshed end-to-end.
+### 1.1 VM State Machine (Phase 0–N)
 
-The daemon and core remain the reference for deterministic virtualization;
-the TUI rides on top as a strictly cosmetic/control surface.
+✅ **Phase‑oriented VM lifecycle**
+- `Init → Validate → PrepareHugepages → PreparePci → ReserveCpus → LaunchQemu → DetectThreads → PinVcpus → DetectMsi → PinIrqs → PeripheralHooks → Shutdown/Cleanup`.
+- Runtime is carried through as a single `VmRuntime` object with deterministic mutation.
 
----
+✅ **Core event model**
+- `CoreEventKind` / `CoreEvent` exist and are accumulated on `VmRuntime`.
+- Events are VM‑scoped and order‑preserving with respect to the state machine.
 
-## 3. Near-Term (v0.4.x – v1.2.x)
-
-### 3.1 Isolation-Level Expansion
-
-- Extend `IsolationLevel` beyond GPUs:
-  - NICs
-  - NVMe
-  - Host-critical controllers
-- Per-device overrides with richer semantics.
-- Additional tests and docs for non-GPU passthrough devices.
-
-### 3.2 Multi-GPU Arbitration
-
-- iGPU/dGPU host anchor selection.
-- Policy surface for “GPU priorities”.
-- Validation of multi-GPU IOMMU group layouts.
-
-### 3.3 VFIO Quality-of-Life
-
-- Dry-run mode for VFIO.
-- Better synthetic inventories and debugging commands.
-- Improved error surfacing for exotic IOMMU group layouts.
-
-### 3.4 TUI Expansion (v1.1.x – v1.3.x)
-
-- Live VM control actions from TUI:
-  - Power on/off
-  - Restart
-  - Rebind devices
-  - Inspect VFIO plan / inventory
-- “Event detail” modal (stacked modals).
-- VM detail modal surfaces isolation policy/mode/default level, IRQ pinning, hugepage
-  state, and peripheral status using a deterministic legend and color scheme
-  (landed in v1.3.0).
-- Sidebar expander for CPU/IRQ heatmaps.
-- Better terminal-agnostic layout (80x24 compatibility mode).
-- Optional kitty-graphics renderer for PCI diagrams and heatmaps.
-- Theme customizer + accessibility mode (high contrast).
-
-### 3.5 PNG Logo & Halo Rework (Post v1.1.0)
-
-- Treat halo as a **tracked, explicit work item**:
-  - Align halo rect strictly with PNG logo rect (origin + height).
-  - Eliminate vertical cropping of wings.
-  - Center dual-wing profiles around the logo centerline with a clear gap.
-- Re-tune aesthetics toward a **Gibson-ish console glow**:
-  - Subtle, low-amplitude breathing tied to `logo_breath_factor`.
-  - Palette-respecting halo (teal/pink/purple with careful blending).
-- Add debug/fixture mode:
-  - Optionally draw halo rect outline in a single color to verify geometry.
-  - Capture reference screenshots for all halo profiles.
-- Only once the above is stable:
-  - Consider enabling a minimal halo as a default profile.
-
-See `HALO_RENDERING_BUG_REFERENCE.md` for the detailed bug capsule and
-acceptance criteria for “fixed”.
+🔜 **Daemon/TUI projection of events**
+- Project per‑VM `CoreEvent`s into daemon IPC snapshots for TUI consumption.
+- Provide phase‑aware views (e.g. “show me everything PCI did for this VM”).
 
 ---
 
-## 4. Medium-Term (v0.5.x – v0.7.x)
+## 2. CPU & NUMA Planning
 
-### NUMA & IRQ Advisor
+### 2.1 CPU Layout & Planning
 
-- Automated inspection and recommendations.
-- Heatmap-style reporting for vCPU placement.
-- Integration with TUI visualization panels.
+✅ **VmCpuLayout & CpuPlan**
+- `VmCpuLayout` holds host/vm CPU sets.
+- `CpuPlan` encapsulates validated mappings between host topology and VM layout.
 
-### Persistence Layer (Optional)
+✅ **Validation on startup**
+- Rejects invalid or nonsensical CPU layouts early (config‑time errors, not runtime flakiness).
 
-- Stable device identity across reboots.
-- Optional persistence of VFIO configuration.
-- Configuration diffing and rollback tooling.
+🔜 **Advanced NUMA biasing**
+- Prefer “local” NUMA nodes for vCPU and IRQ placement where possible.
+- Express NUMA intent more richly in config (beyond a single preferred node).
 
----
+### 2.2 IRQ Pinning
 
-## 5. Long-Term (v0.7.x – v1.0)
+🚧 **IRQ pinning with completion latch**
+- IRQ pinning runs asynchronously after QEMU launch.
+- `irq_pinning_complete: AtomicBool` on `VmRuntime` acts as a latch once IRQs are pinned.
+- No timers, no polling loops; callers simply check or re‑invoke deterministic helpers.
 
-### Deterministic VM Lifecycle
-
-- Stronger invariants across Phase 1–9.
-- Deterministic startup/teardown across identical host states.
-- Better replayability for regression testing.
-
-### Hardened Mode
-
-- Reduced nondeterminism envelope.
-- Stricter syscall fences around VFIO operations.
-- Optional “paranoid mode” for high-assurance deployments.
-
-### Daemon (chalybsd)
-
-- Persistent control plane.
-- IPC/HTTP API.
-- Telemetry, logging aggregation, event bus.
-- TUI and CLI clients are first-class consumers, not special snowflakes.
+🔜 **More granular IRQ summaries**
+- Attach “IRQ mapping summaries” to `VmRuntime` for TUI representation.
+- Provide deterministic ordering (by device, by vector, etc.).
 
 ---
 
-## 6. Testing & Tooling (Cross-Cutting)
+## 3. PCI, VFIO & Isolation
 
-- Unit tests for policy + level interactions.
-- Integration tests for VFIO plan/execute/verify/restore.
-- Tools for synthetic PCI inventories and topology simulation.
-- Golden fixtures for TUI visuals (including halo profiles once fixed).
+### 3.1 GPU Safety & Policy
 
-The roadmap is a living document; each tagged release must update this file to
-reflect what actually shipped and what moved to the next horizon.
+✅ **GPU policy preflight (Phase 1–3)**
+- PCI inventory + GPU detection via `PciInventory::scan()`.
+- Safety classification into `GpuSafetyClass` plus unbind feasibility assessment.
+- Single‑GPU host protection via `[vm.<name>.gpu] allow_single_gpu = true` gating.
 
-## Phase 10A: Synthetic Removal — Completed
-- All synthetic VM and event paths removed.
-- Daemon now reflects real config + PCI + state machines.
+✅ **Prepare GPU passthrough (Phase 4)**
+- Enforces “Unsafe” unbind assessment as a hard failure.
+- Logs “Risky” assessments but proceeds per operator policy.
+- Performs deterministic unbind + bind to `vfio-pci`.
 
-## Phase 11: Real Daemon/Core Integration — Completed
-- Real VmStateMachine tied into daemon tick.
-- IPC snapshot now reflects live VM states and events.
+### 3.2 PCI Root‑Port Placement
+
+✅ **Deterministic pci_rootport mapping**
+- `build_pci_rootport_map` assigns stable PCIe root‑port slots to all passthrough devices.
+- Priority ordering: GPU → NVMe → NIC → USB, each sorted by BDF.
+- Supports explicit overrides via `qemu.pci_rootport` with validation.
+- Emits `bus=pcie.0,addr=0xNN` for each `vfio-pci` device.
+
+### 3.3 Isolation Policy (Phase 8/9)
+
+✅ **Configurable isolation modes**
+- `IsolationMode = Disabled | Audit | Enforce`.
+- Defaults to `Disabled` to preserve legacy behavior.
+
+✅ **IsolationLevel per device**
+- `Dedicated`, `SharedWithHost`, `Forbidden` semantics modeled, ready for Phase 9 enforcement.
+
+🔜 **Phase 9 enforcement & findings**
+- Implement full IOMMU group / multifunction / host‑critical device checks.
+- Emit structured isolation findings into `VmRuntime.events`.
+- In `Enforce` mode, abort startup on violations before touching sysfs.
 
 ---
 
-## Added for v1.2.0 — NUMA/RTC/QEMU Determinism Milestone
+## 4. QEMU Builder & CPU/SMBIOS Extras
 
-### ✔ Completed in v1.2.0
-- Introduced TOML-configurable QEMU RTC policy
-- Deterministic NUMA node + hugepage allocation pipeline
-- Config.rs fully reconstructed (no truncation, Deserialize-correct)
-- QEMU argument layers finalized (pre/core/mid/post)
-- NUMA correctness hooks for future hugepage allocator + LG SHM
+### 4.1 QEMU Command Builder
 
-### 🚧 In Progress (v1.3.0 target)
-- Deterministic VmStateMachine (step + step_shutdown)
-- Hugepage allocator (deterministic node placement)
-- Looking Glass SHM NUMA placement
-- IRQ locality enforcement
-- TUI numactl/pinning inspector
+✅ **Declarative QEMU command construction**
+- `QemuCommandBuilder` builds a “dumb data” `QemuCommand`:
+  - Core args: `-enable-kvm`, `-cpu`, `-smp`, `-m`, optional hugepages.
+  - Machine/firmware: `-machine q35,accel=kvm`, OVMF code/vars drives.
+  - QMP: per‑VM Unix socket under `/run/chalybs`.
+  - VFIO devices: deterministic root‑port mapping, optional `rombar=0`.
+  - SMBIOS: `-smbios type=0/1/2` driven by config.
 
-### v1.2.1 checkpoint (2025-12-02)
+✅ **CPU model & extras plumbing**
+- `qemu.cpu_model` and `qemu.cpu_extras` merged into a single `-cpu` string.
+- Supports `"auto"` detection path via `cpu::detect::autodetect_qemu_cpu_model()`.
+- Preserves legacy “ABI / TOPO / HV_CONTEXTS / VENDOR_ID” semantics.
 
-- **Segmented VmStateMachine** is now in-tree (`step`, `run_until_steady`, `step_shutdown`, `run_shutdown`), covering validation, hugepages, PCI/VFIO staging, CPU reservation, QEMU launch, IRQ worker spawn, and peripheral hooks.
-- **VM-scoped lifecycle events** (`CoreEvent*` on `VmRuntime`) are plumbed through to the daemon/TUI for the events rail and F2 VM detail modal.
-- **IRQ locality workstream** has its first concrete piece: an asynchronous MSI/MSI-X worker with NUMA-aware CPU selection and config-only aux-GPU detection. Further refinements remain under the existing IRQ locality + TUI inspector workstreams.
+✅ **RTC policy**
+- Configurable via `qemu.rtc` with the following behavior:
+  - `Some(non-empty)` → `-rtc <value>`.
+  - `Some("")` → skip `-rtc` entirely (QEMU default).
+  - `None` → default `-rtc base=localtime,driftfix=slew` (Bash parity).
 
+---
 
-v1.2.2 checkpoint (2025-12-03)
+## 5. Peripherals
 
-- **VFIO dedicated passthrough restore semantics** is now wired through the VFIO staging and `RestorePci` phases. Devices that are already bound to `vfio-pci` at staging time are treated as dedicated passthrough and are excluded from driver transition bookkeeping; shutdown leaves them alone instead of trying to guess a host driver.
-- **RestorePci summary reporting** now produces explicit per-VM summaries in both dry-run and live modes, including the “no recorded transitions” case, so you can see at a glance whether PCI restore actually touched anything for a VM.
-- **Host-critical GPU host-only warnings** extend the VFIO isolation checker: host-only IOMMU groups that contain GPUs considered host-critical are now logged as warnings, keeping host GPU safety visible without blocking VM startup when no passthrough devices live in that group.
+### 5.1 Tasmota (MQTT Relay Power)
 
+✅ **Tasmota peripheral hooks**
+- `[vm.<name>.peripherals.tasmota]` with deterministic topic and payloads.
+- `vm_up` publishes `"ON"`, `vm_down` publishes `"OFF"`.
+- `VmRuntime.tasmota_powered: Cell<bool>` tracks best‑known state.
 
-- Completed: Deterministic PCI slot allocator, GPU arg logic.
-- Next: Additional feature phases.
+🔜 **Daemon/TUI power view**
+- Surface Tasmota state in daemon snapshots for TUI display (per‑VM “powered” indicator).
 
-## v1.3.x – CPU planner & QEMU determinism (snapshot as of v1.3.5)
+### 5.2 DDC / Monitor Input Switching
 
-Status: **Partially complete – core work landed in v1.3.5**
+✅ **In‑tree DDC client**
+- Replaces external `ddcutil` dependency with direct I²C/EDID/DDC handling in Rust.
+- Deterministic bus selection and input codes driven by `DdcConfig`.
 
-### Completed in v1.3.5
+✅ **IRQ‑gated VM‑up behavior**
+- `apply_vm_up` defers DDC `vm_up` until `irq_pinning_complete == true`.
+- No polling, no timers: daemon/TUI re‑invokes `apply_vm_up` when the latch flips.
+- Clear `CoreEvent` emitted when DDC is deferred.
 
-- Host CPU detection and QEMU CPU model mapping:
-  - `cpu::detect` derives a concrete `CpuIdentity` from the host.
-  - A deterministic mapping selects a supported QEMU CPU model string (e.g. `EPYC-v2`).
-- NUMA-aware CPU planning:
-  - `HostNumaTopology` is discovered from sysfs and logged explicitly.
-  - A new `CpuPlan` layer validates that vCPU assignment, NUMA node selection, cpusets, and hugepage placement are coherent.
-  - Validation is wired into the existing `Validate` / `ReserveCpus` phases and fails hard on inconsistency.
-- QEMU launch command builder:
-  - `QemuCommand` + `QemuCommandBuilder` now own QEMU argument construction end-to-end.
-  - RTC, SMBIOS, hugepages, firmware, QMP, and vfio device wiring are all driven through the builder.
-  - Deterministic PCIe root-port allocation (`qemu.pci_rootport` + auto-assignment) is integrated into the QEMU launch path.
+🚧 **DDC send test coverage**
+- Most DDC tests are green; `send_ddc_set_input` integration behavior still under active validation.
+- Next step: finish the last DDC test, document any hardware‑specific quirks.
 
-### Remaining / follow-ups
+### 5.3 Looking Glass (ivshmem)
 
-- Add focused unit and integration tests for:
-  - CPU detection / QEMU model mapping on additional host SKUs.
-  - CpuPlan validation edge cases (oversubscription, misaligned NUMA, invalid cpuset layouts).
-  - QemuCommandBuilder argument ordering, especially around `pre_args`, mid-args, and `post_args`.
-- Extend the architecture docs and TUI introspection views to surface:
-  - The resolved QEMU CPU model for each VM.
-  - The effective CPU plan (vCPU → host CPU, NUMA node).
-  - The final QEMU command line for debugging and regression checks.
+✅ **Deterministic SHM preparation**
+- `[vm.<name>.peripherals.looking_glass]` drives SHM creation:
+  - `shm_name` (typically `/dev/shm/looking-glass`)
+  - `mem_mb` (size in MiB)
+- `prepare_looking_glass_shm`:
+  - Creates/truncates the file, sizes it to `mem_mb` MiB, sets mode `0660`.
+  - Resolves desktop user via environment (SUDO_USER/DOAS_USER/USER/LOGNAME).
+  - Resolves `uid` from `/etc/passwd` and `gid` from `kvm` or the user’s primary group.
+  - `chown(path, uid, gid)` with clear logging.
+  - Treats creation/sizing failures as **hard** QEMU errors; ownership issues are warnings only.
 
+✅ **Crash‑safe / reboot‑safe behavior**
+- Uses create+truncate semantics so stale SHM from a prior crash is harmless.
+- VM startup is responsible for (re)creating the SHM backing file each time.
+
+✅ **QEMU ivshmem wiring**
+- Adds:
+  - `-object memory-backend-file,id=ivshmem,share=on,mem-path=<shm>,size=<mem_mb>M`
+  - `-device ivshmem-plain,memdev=ivshmem,bus=pcie.0`
+
+✅ **Teardown cleanup**
+- SHM is removed deterministically on VM shutdown.
+- Ensures no stale `/dev/shm/looking-glass` file remains between runs.
+
+🔜 **NUMA‑aware SHM placement (Phase 12B)**
+- Optionally integrate hugepage/NUMA placement for LG SHM where useful.
+- Make this explicit and opt‑in to avoid surprising behavior.
+
+### 5.4 SPICE (Clipboard / Input / Convenience Channel)
+
+✅ **SPICE peripheral config**
+- `[vm.<name>.peripherals.spice]`:
+  - `enabled = true|false`
+  - `port = <u16>` (e.g. 5900)
+  - `addr = "<ip or hostname>"` (e.g. `"127.0.0.1"`)
+- Works as a pure peripheral: no effect unless configured.
+
+✅ **SPICE QEMU wiring (the SPICE must flow)**
+- When enabled and valid:
+  - `-device virtio-serial-pci,id=virtio-serial0,max_ports=16,bus=pcie.0,addr=0x10`
+  - `-chardev spicevmc,name=vdagent,id=vdagent`
+  - `-device virtserialport,nr=1,bus=virtio-serial0.0,chardev=vdagent,name=com.redhat.spice.0`
+  - `-spice port=<port>,addr=<addr>,disable-ticketing=on`
+
+✅ **SPICE lifecycle logging**
+- `SpiceHook` emits clear `vm_up` / `vm_down` logs when enabled.
+- When disabled but present in config, logs that it is “present but disabled”.
+
+🔜 **Tighter daemon/TUI integration**
+- Surface SPICE endpoints (addr/port) in daemon snapshots for TUI to show “connect” hints.
+- Optional integration hints for Looking Glass + SPICE combo workflows.
+
+---
+
+## 6. Config & Validation
+
+### 6.1 TOML Structure
+
+✅ **Stable config layout**
+- `RootConfig` with `vm`, `logging`, plus per‑VM:
+  - `cpu`, `qemu`, `numa`, `devices`, `gpu`, `isolation`, `peripherals`.
+- `PeripheralConfig` holds `tasmota`, `ddc`, `looking_glass`, `spice`.
+
+✅ **Basic validation**
+- Ensures at least one VM exists.
+- Validates `num_vcpus > 0` and non‑empty CPU syntax.
+
+🔜 **Deeper config validation**
+- Cross‑check PCI BDFs against inventory at startup (with controlled behavior in headless/offline modes).
+- Validate DDC buses / inputs in a read‑only preflight before exposing them to runtime.
+
+---
+
+## 7. Daemon & TUI Integration
+
+### 7.1 Daemon
+
+🔜 **Event‑rich IPC snapshots**
+- Include `VmRuntime.events`, IRQ latch state, Tasmota power, LG SPICE flags, etc.
+- Stabilize IPC schema so the TUI can evolve without reshaping the core often.
+
+🔜 **Multi‑VM orchestration**
+- Clean handling of multiple concurrent VMs, including ordering guarantees when bringing up or tearing down groups.
+
+### 7.2 TUI
+
+🧪 **“Coherent visual field” design**
+- Represent VM lifecycle, PCI/VFIO state, IRQ status, and peripherals in a single coherent view.
+- Avoid “UI flapping” or noisy refresh cycles; prefer stateful, phase‑aware transitions.
+
+🔜 **Per‑VM detail panels**
+- Show CPU plan, NUMA layout, IRQ pinning, PCI root‑port assignments, and peripheral status (DDC/LG/SPICE/Tasmota).
+
+---
+
+## 8. Testing, Tooling & Quality
+
+### 8.1 Test Coverage
+
+🚧 **Unit & integration tests**
+- Broad coverage across CPU planning, PCI policy, and QEMU builder behavior.
+- DDC coverage is mostly green; last remaining test focuses on `send_ddc_set_input` semantics.
+
+🔜 **Hardware‑aware test harness**
+- Structured “test matrix” for known hardware configs (e.g. WX/Threadripper layouts, specific GPUs).
+- Targeted regression tests for specific quirks (e.g. IOMMU group oddities, multi‑function devices).
+
+### 8.2 Tooling & Release Discipline
+
+✅ **Semantic versioning**
+- v1.3.5 → v1.4.0 for the current cycle (DDC client, LG SHM, SPICE peripheral).
+- Behavior‑changing features are captured in CHANGELOG / RELEASE_NOTES.
+
+🔜 **Continuous integration**
+- Wire up a conservative CI pipeline:
+  - `cargo build`, `cargo test`, `cargo clippy` with agreed‑upon lint configuration.
+  - Fast, deterministic, no flaky hardware dependencies.
+
+---
+
+## 9. Future & “Someday / Maybe”
+
+🧪 **Advanced scheduling / isolation modes**
+- Explore alternate `cgroups` v2 profiles and NUMA policies for ultra‑low‑latency VMs.
+- Optional “strict isolation” preset that pushes more checks into Enforce‑mode defaults.
+
+🧪 **More sophisticated PCI/ACS awareness**
+- Per‑platform ACS quirks database (purely declarative, clearly versioned).
+- Ability to surface hardware restrictions and recommended BIOS settings through the TUI.
+
+🧪 **Alternative front‑ends**
+- TUI‑only “headless controller” modes.
+- Possible future REST/gRPC control plane (still strictly deterministic).
+
+💤 **Non‑x86 architectures**
+- No near‑term plan, but the core model should keep ARM/other architectures in mind where straightforward.
+
+---
+
+## 10. Current Cycle Summary (v1.4.0)
+
+This release cycle (from v1.3.5 → v1.4.0) captures:
+
+- ✅ In‑tree DDC client for monitor input switching (no external `ddcutil` dependency).
+- ✅ IRQ‑gated DDC vm_up behavior with deterministic latch semantics.
+- ✅ Looking Glass SHM bring‑up and teardown:
+  - Deterministic user/ownership resolution.
+  - Crash‑safe/reboot‑safe SHM recreation.
+- ✅ SPICE peripheral wiring in QEMU builder:
+  - Virtio‑serial, vdagent channel, and SPICE server flags.
+  - Clean on/off semantics via `[vm.<name>.peripherals.spice] enabled`.
+- 🚧 Remaining: tighten DDC tests (`send_ddc_set_input`) and finish documentation updates for this cycle.
+
+Everything else above remains either historical, in progress, or planned work for upcoming minor/patch releases.

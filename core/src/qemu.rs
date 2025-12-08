@@ -1,9 +1,16 @@
 // core/src/qemu.rs
 
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+use std::ffi::CString;
+use std::os::unix::fs::OpenOptionsExt;
+
+use libc;
 
 use tracing::{debug, info, warn};
 
@@ -160,7 +167,143 @@ impl<'a> QemuCommandBuilder<'a> {
         add_vfio_pci_devices(&mut self.args, self.rt)
     }
 
-    /// 7) Mid-section extra args (`q.args`).
+    /// 7) Looking Glass ivshmem wiring (if configured).
+    ///
+    /// This mirrors the legacy Bash semantics:
+    ///
+    ///   -object memory-backend-file,id=ivshmem,share=on,mem-path=$LG_PATH,size=${LG_MEM}M
+    ///   -device ivshmem-plain,memdev=ivshmem,bus=pcie.0
+    ///
+    /// but expressed in declarative form and driven from:
+    ///   [vm.<name>.peripherals.looking_glass]
+    ///   shm_name = "/dev/shm/looking-glass"
+    ///   mem_mb   = 128
+    fn apply_looking_glass(&mut self) {
+        let lg = match self
+            .rt
+            .cfg
+            .peripherals
+            .as_ref()
+            .and_then(|p| p.looking_glass.as_ref())
+        {
+            Some(cfg) => cfg,
+            None => return,
+        };
+
+        if lg.mem_mb == 0 {
+            warn!(
+                vm = %self.rt.name,
+                shm = %lg.shm_name,
+                "qemu: Looking Glass configured with mem_mb=0; skipping ivshmem wiring"
+            );
+            return;
+        }
+
+        let shm_path = &lg.shm_name;
+        let mem_mb = lg.mem_mb;
+
+        // memory-backend-file first, then the ivshmem-plain device that
+        // references it; QEMU is tolerant of ordering, but this is the
+        // least surprising and most explicit form.
+        self.args.push("-object".to_string());
+        self.args.push(format!(
+            "memory-backend-file,id=ivshmem,share=on,mem-path={},size={}M",
+            shm_path, mem_mb
+        ));
+
+        self.args.push("-device".to_string());
+        self.args
+            .push("ivshmem-plain,memdev=ivshmem,bus=pcie.0".to_string());
+
+        info!(
+            vm = %self.rt.name,
+            shm = %shm_path,
+            mem_mb,
+            "qemu: wired Looking Glass ivshmem backend and device"
+        );
+    }
+
+    /// 8) SPICE wiring (if configured and enabled).
+    ///
+    /// This mirrors your legacy Bash suite semantics:
+    ///
+    ///   -device virtio-serial-pci,id=virtio-serial0,max_ports=16,bus=pcie.0,addr=0x10
+    ///   -chardev spicevmc,name=vdagent,id=vdagent
+    ///   -device virtserialport,nr=1,bus=virtio-serial0.0,chardev=vdagent,name=com.redhat.spice.0
+    ///   -spice port=<port>,addr=<addr>,disable-ticketing=on
+    fn apply_spice(&mut self) -> Result<()> {
+        let spice = match self
+            .rt
+            .cfg
+            .peripherals
+            .as_ref()
+            .and_then(|p| p.spice.as_ref())
+        {
+            Some(cfg) => cfg,
+            None => return Ok(()),
+        };
+
+        if !spice.enabled {
+            info!(
+                vm = %self.rt.name,
+                "qemu: SPICE peripheral present but disabled; skipping wiring"
+            );
+            return Ok(());
+        }
+
+        if spice.port == 0 {
+            return Err(ChalybsError::Qemu(format!(
+                "vm {}: peripherals.spice.enabled = true but port=0; \
+                 please set a valid SPICE TCP port",
+                self.rt.name
+            )));
+        }
+
+        let addr = spice.addr.trim();
+        if addr.is_empty() {
+            return Err(ChalybsError::Qemu(format!(
+                "vm {}: peripherals.spice.enabled = true but addr is empty; \
+                 please set peripherals.spice.addr",
+                self.rt.name
+            )));
+        }
+
+        // Virtio-serial bus for vdagent, fixed addr=0x10 on pcie.0 (matches Bash).
+        self.args.push("-device".to_string());
+        self.args.push(
+            "virtio-serial-pci,id=virtio-serial0,max_ports=16,bus=pcie.0,addr=0x10".to_string(),
+        );
+
+        // vdagent channel via spicevmc.
+        self.args.push("-chardev".to_string());
+        self.args
+            .push("spicevmc,name=vdagent,id=vdagent".to_string());
+
+        self.args.push("-device".to_string());
+        self.args.push(
+            "virtserialport,nr=1,bus=virtio-serial0.0,chardev=vdagent,name=com.redhat.spice.0"
+                .to_string(),
+        );
+
+        // SPICE server itself.
+        self.args.push("-spice".to_string());
+        self.args.push(format!(
+            "port={port},addr={addr},disable-ticketing=on",
+            port = spice.port,
+            addr = addr,
+        ));
+
+        info!(
+            vm = %self.rt.name,
+            port = spice.port,
+            addr = addr,
+            "qemu: wired SPICE server and vdagent virtio-serial channel"
+        );
+
+        Ok(())
+    }
+
+    /// 9) Mid-section extra args (`q.args`).
     fn apply_mid_args(&mut self) {
         let q = &self.rt.cfg.qemu;
 
@@ -173,7 +316,7 @@ impl<'a> QemuCommandBuilder<'a> {
         }
     }
 
-    /// 8) Post-arguments (`q.post_args`).
+    /// 10) Post-arguments (`q.post_args`).
     fn apply_post_args(&mut self) {
         let q = &self.rt.cfg.qemu;
 
@@ -631,13 +774,301 @@ fn apply_rtc_args(args: &mut Vec<String>, rt: &VmRuntime) {
     }
 }
 
+/// Detect the desktop user in a deterministic, minimal-heuristic way.
+///
+/// Priority:
+///   1. SUDO_USER
+///   2. DOAS_USER
+///   3. USER
+///   4. LOGNAME
+///
+/// "root" is ignored, since the whole point is to discover the
+/// non-root desktop session user that invoked Chalybs via sudo/doas.
+fn detect_desktop_username() -> Option<String> {
+    const CANDIDATES: &[&str] = &["SUDO_USER", "DOAS_USER", "USER", "LOGNAME"];
+
+    for key in CANDIDATES {
+        if let Ok(val) = env::var(key) {
+            let v = val.trim();
+            if !v.is_empty() && v != "root" {
+                return Some(v.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Minimal /etc/passwd lookup for a single user.
+///
+/// Returns (uid, primary_gid) on success.
+fn lookup_user(username: &str) -> Option<(u32, u32)> {
+    let data = fs::read_to_string("/etc/passwd").ok()?;
+
+    for line in data.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+
+        if parts[0] == username {
+            let uid = parts[2].parse::<u32>().ok()?;
+            let gid = parts[3].parse::<u32>().ok()?;
+            return Some((uid, gid));
+        }
+    }
+
+    None
+}
+
+/// Minimal /etc/group lookup for a single group name.
+///
+/// Returns gid on success.
+fn lookup_group(group_name: &str) -> Option<u32> {
+    let data = fs::read_to_string("/etc/group").ok()?;
+
+    for line in data.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+
+        if parts[0] == group_name {
+            let gid = parts[2].parse::<u32>().ok()?;
+            return Some(gid);
+        }
+    }
+
+    None
+}
+
+/// Thin wrapper over libc::chown for a single path.
+fn chown_path(path: &str, uid: u32, gid: u32) -> std::io::Result<()> {
+    let cstr = CString::new(path.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path for chown contains interior NUL",
+        )
+    })?;
+
+    let rc = unsafe { libc::chown(cstr.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Deterministic preparation of the Looking Glass shared-memory backing file.
+///
+/// Semantics:
+///   - If no looking_glass peripheral is configured → no-op.
+///   - If mem_mb == 0 → log + no-op (mirrors ivshmem wiring behavior).
+///   - Otherwise:
+///       * Create/truncate the shm file at the configured path.
+///       * Size it to mem_mb MiB.
+///       * Set mode 0660.
+///       * Resolve a desktop username (env-based, deterministic order).
+///       * Resolve uid/gid from /etc/passwd and /etc/group (kvm).
+///       * chown(path, uid, gid_for_kvm_or_primary_group).
+///
+/// Any failure to *create or size* the file is treated as a hard QEMU
+/// error. Failures to detect the user or to chown are logged as warnings
+/// but do not block VM startup.
+fn prepare_looking_glass_shm(rt: &VmRuntime) -> Result<()> {
+    let lg = match rt
+        .cfg
+        .peripherals
+        .as_ref()
+        .and_then(|p| p.looking_glass.as_ref())
+    {
+        Some(cfg) => cfg,
+        None => return Ok(()),
+    };
+
+    if lg.mem_mb == 0 {
+        info!(
+            vm = %rt.name,
+            shm = %lg.shm_name,
+            "looking-glass: mem_mb=0; skipping shm preparation"
+        );
+        return Ok(());
+    }
+
+    let shm_path = lg.shm_name.as_str();
+    let mem_bytes = lg.mem_mb * 1024 * 1024;
+
+    // Parent directory creation is effectively a no-op for /dev/shm,
+    // but this keeps behavior well-defined if a different path is used.
+    if let Some(parent) = Path::new(shm_path).parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            fs::create_dir_all(parent).map_err(|e| {
+                ChalybsError::Qemu(format!(
+                    "looking-glass: failed to create parent directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+
+    // Create/truncate the shm file and size it deterministically.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o660)
+        .open(shm_path)
+        .map_err(|e| {
+            ChalybsError::Qemu(format!(
+                "looking-glass: failed to create shm file {}: {e}",
+                shm_path
+            ))
+        })?;
+
+    file.set_len(mem_bytes).map_err(|e| {
+        ChalybsError::Qemu(format!(
+            "looking-glass: failed to size shm file {} to {} bytes: {e}",
+            shm_path, mem_bytes
+        ))
+    })?;
+
+    // Resolve desktop user.
+    let username = match detect_desktop_username() {
+        Some(u) => u,
+        None => {
+            warn!(
+                vm = %rt.name,
+                shm = %shm_path,
+                "looking-glass: could not determine desktop user from environment; \
+                 leaving shm ownership as-is"
+            );
+            return Ok(());
+        }
+    };
+
+    let (uid, primary_gid) = match lookup_user(&username) {
+        Some(pair) => pair,
+        None => {
+            warn!(
+                vm = %rt.name,
+                shm = %shm_path,
+                user = %username,
+                "looking-glass: user not found in /etc/passwd; leaving shm ownership as-is"
+            );
+            return Ok(());
+        }
+    };
+
+    // Prefer the kvm group if present; otherwise fall back to the
+    // user's primary group. This mirrors your Bash semantics without
+    // introducing additional heuristics.
+    let gid = lookup_group("kvm").unwrap_or(primary_gid);
+
+    match chown_path(shm_path, uid, gid) {
+        Ok(()) => {
+            info!(
+                vm = %rt.name,
+                shm = %shm_path,
+                user = %username,
+                uid,
+                gid,
+                "looking-glass: prepared shm file with deterministic ownership"
+            );
+        }
+        Err(e) => {
+            warn!(
+                vm = %rt.name,
+                shm = %shm_path,
+                user = %username,
+                uid,
+                gid,
+                "looking-glass: failed to chown shm file; leaving ownership as-is: {e}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Best-effort cleanup of the Looking Glass shared-memory backing file.
+///
+/// Semantics:
+///   - If no looking_glass peripheral is configured → no-op.
+///   - If mem_mb == 0 → no-op (mirrors preparation semantics).
+///   - Otherwise, attempt to remove the shm file:
+///       * Success      → info log.
+///       * NotFound     → info log, nothing to do.
+///       * Other errors → warn, but do not fail shutdown.
+fn cleanup_looking_glass_shm(rt: &VmRuntime) {
+    let lg = match rt
+        .cfg
+        .peripherals
+        .as_ref()
+        .and_then(|p| p.looking_glass.as_ref())
+    {
+        Some(cfg) => cfg,
+        None => return,
+    };
+
+    if lg.mem_mb == 0 {
+        info!(
+            vm = %rt.name,
+            shm = %lg.shm_name,
+            "looking-glass: mem_mb=0; skipping shm cleanup"
+        );
+        return;
+    }
+
+    let shm_path = lg.shm_name.as_str();
+
+    match fs::remove_file(shm_path) {
+        Ok(()) => {
+            info!(
+                vm = %rt.name,
+                shm = %shm_path,
+                "looking-glass: removed shm file at VM teardown"
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!(
+                vm = %rt.name,
+                shm = %shm_path,
+                "looking-glass: shm file already absent at teardown; nothing to do"
+            );
+        }
+        Err(e) => {
+            warn!(
+                vm = %rt.name,
+                shm = %shm_path,
+                "looking-glass: failed to remove shm file at teardown: {e}"
+            );
+        }
+    }
+}
+
 /// Launch QEMU and move it into the vm cpuset.
 pub fn launch(rt: &mut VmRuntime) -> Result<()> {
-    let vm_name = &rt.name;
+    let vm_name = rt.name.clone();
 
     // Ensure /run/chalybs exists for QMP sockets, etc.
     fs::create_dir_all("/run/chalybs")
         .map_err(|e| ChalybsError::Qemu(format!("failed to create /run/chalybs: {e}")))?;
+
+    // Deterministically prepare the Looking Glass shm backing file *before*
+    // wiring it into QEMU. This mirrors the legacy Bash semantics with
+    // NUMA/hugepage awareness handled by the rest of Chalybs.
+    prepare_looking_glass_shm(&rt)?;
 
     // Declarative command construction via builder.
     let mut builder = QemuCommandBuilder::new(rt);
@@ -647,6 +1078,8 @@ pub fn launch(rt: &mut VmRuntime) -> Result<()> {
     builder.apply_rtc();
     builder.apply_smbios();
     builder.apply_vfio_pci_devices()?;
+    builder.apply_looking_glass();
+    builder.apply_spice()?;
     builder.apply_mid_args();
     builder.apply_post_args();
 
@@ -732,5 +1165,8 @@ pub fn shutdown(rt: &mut VmRuntime) -> Result<()> {
     })?;
 
     info!(pid = q.pid, ?status, "QEMU exited");
+
+    cleanup_looking_glass_shm(rt);
+
     Ok(())
 }
