@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -6,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, AppEvent, AppEventKind, VisualEffects, VmState};
+use crate::app::{App, AppEvent, AppEventKind, VisualEffects, VmState, VmStatus};
 use crate::glitch::{
     affects_region, glitch_profile, junk_prefix, space_jitter, tick_for_region, GlitchMode,
     GlitchProfile, REGION_BORDERS, REGION_EVENTS, REGION_HEADER, REGION_SPARK, REGION_VMS,
@@ -628,6 +630,145 @@ fn draw_vm_detail_modal(f: &mut Frame, app: &App, glitch: &GlitchProfile) {
             Span::styled(hp_text, hp_style),
         ]));
 
+        // CPU layout/topology block derived from IPC cpu_layout projection.
+        lines.push(Line::from(""));
+
+        lines.push(Line::from(Span::styled(
+            "CPU layout",
+            theme::header_title(),
+        )));
+
+        match compute_cpu_topology(vm) {
+            CpuTopologyStatus::Available {
+                vcpu_pairs,
+                host_pairs,
+            } => {
+                // vCPU pairs (compact, SMT-oriented).
+                let mut vcpu_spans = Vec::new();
+                vcpu_spans.push(Span::raw("  "));
+                vcpu_spans.push(Span::styled("vCPU pairs: ", theme::dim_text()));
+
+                if vcpu_pairs.is_empty() {
+                    vcpu_spans.push(Span::styled("none", theme::dim_text()));
+                } else {
+                    let mut first = true;
+                    for (a, b) in &vcpu_pairs {
+                        if !first {
+                            vcpu_spans.push(Span::raw("  "));
+                        }
+                        first = false;
+                        vcpu_spans.push(Span::styled(format!("[{a},{b}]"), theme::normal_text()));
+                    }
+                }
+
+                lines.push(Line::from(vcpu_spans));
+
+                // Host SMT-ish groups: one line per core_id.
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("Host SMT groups:", theme::dim_text()),
+                ]));
+
+                if host_pairs.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled("none", theme::dim_text()),
+                    ]));
+                } else {
+                    for (core_id, threads) in &host_pairs {
+                        let mut line_spans = Vec::new();
+                        line_spans.push(Span::raw("    "));
+                        line_spans
+                            .push(Span::styled(format!("core {core_id}: "), theme::dim_text()));
+
+                        if threads.is_empty() {
+                            line_spans.push(Span::styled("[]", theme::dim_text()));
+                        } else if threads.len() == 1 {
+                            line_spans.push(Span::styled(
+                                format!("[{}]", threads[0]),
+                                theme::normal_text(),
+                            ));
+                        } else {
+                            let list = threads
+                                .iter()
+                                .map(|t| t.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            line_spans
+                                .push(Span::styled(format!("[{list}]"), theme::normal_text()));
+                        }
+
+                        lines.push(Line::from(line_spans));
+                    }
+                }
+
+                // Mapping: vCPU pair → host SMT group, up to min(len).
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("Mapping:", theme::dim_text()),
+                ]));
+
+                let map_len = vcpu_pairs.len().min(host_pairs.len());
+
+                if map_len == 0 {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(
+                            "unavailable — no overlapping vCPU/host groups",
+                            theme::dim_text(),
+                        ),
+                    ]));
+                } else {
+                    for idx in 0..map_len {
+                        let (v0, v1) = vcpu_pairs[idx];
+                        let (core_id, threads) = &host_pairs[idx];
+
+                        let host_disp = if threads.is_empty() {
+                            "[]".to_string()
+                        } else if threads.len() == 1 {
+                            format!("[{}]", threads[0])
+                        } else {
+                            let list = threads
+                                .iter()
+                                .map(|t| t.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            format!("[{list}]")
+                        };
+
+                        lines.push(Line::from(vec![
+                            Span::raw("    "),
+                            Span::styled(
+                                format!("vCPUs [{v0},{v1}] \u{2192} ",),
+                                theme::normal_text(),
+                            ),
+                            Span::styled(
+                                format!("core {core_id} {host_disp}"),
+                                theme::normal_text(),
+                            ),
+                        ]));
+                    }
+
+                    if vcpu_pairs.len() != host_pairs.len() {
+                        lines.push(Line::from(vec![
+                            Span::raw("    "),
+                            Span::styled(
+                                "note: mapping truncated — vCPU and host group counts differ",
+                                theme::dim_text(),
+                            ),
+                        ]));
+                    }
+                }
+            }
+            CpuTopologyStatus::Unavailable(msg) => {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("CPU topology: ", theme::dim_text()),
+                    Span::styled(msg, theme::normal_text()),
+                ]));
+            }
+        }
+
         lines.push(Line::from(""));
     } else {
         lines.push(Line::from(Span::styled(
@@ -792,6 +933,94 @@ fn apply_scanline_style(
     }
 
     style
+}
+
+/// Highly strict CPU topology status.
+///
+/// In the updated semantics:
+/// - Available: we have *some* vCPU pairs and *some* host groups.
+///   We always show what we have and only truncate the mapping if
+///   counts differ.
+/// - Unavailable: we truly have nothing meaningful to show
+///   (e.g., no vCPUs or no host CPUs at all).
+enum CpuTopologyStatus {
+    Available {
+        vcpu_pairs: Vec<(u32, u32)>,
+        host_pairs: Vec<(u32, Vec<u32>)>, // (core_id, [threads...])
+    },
+    Unavailable(&'static str),
+}
+
+/// Compute a deterministic CPU topology for a VM with tolerant semantics.
+///
+/// Updated "Choice 1 / Option 2" behavior:
+/// - Require at least 2 vCPUs to form any pairs; odd tails are ignored in
+///   the pairing, but we do not treat that as an error.
+/// - Host CPUs are grouped into "SMT-ish" cores via core_id = cpu / 2.
+///   Cores may have 1 or 2 (or more, theoretically) threads; we keep exactly
+///   what we see and refuse to fabricate idealized pairs.
+/// - Mapping is left to the caller; we do *not* treat differing counts as an
+///   error anymore.
+fn compute_cpu_topology(vm: &VmStatus) -> CpuTopologyStatus {
+    // vCPU side.
+    let mut vcpus = vm.cpu_layout.vm.clone();
+    vcpus.sort_unstable();
+
+    if vcpus.len() < 2 {
+        return CpuTopologyStatus::Unavailable("no vCPU pairs available for this VM");
+    }
+
+    // Only full pairs; ignore any odd tail deterministically.
+    let vcpu_pairs: Vec<(u32, u32)> = vcpus
+        .chunks(2)
+        .filter_map(|chunk| {
+            if chunk.len() == 2 {
+                Some((chunk[0], chunk[1]))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if vcpu_pairs.is_empty() {
+        return CpuTopologyStatus::Unavailable("no vCPU pairs available for this VM");
+    }
+
+    // Host side.
+    let mut host = vm.cpu_layout.host.clone();
+    host.sort_unstable();
+
+    if host.is_empty() {
+        return CpuTopologyStatus::Unavailable("no host CPUs assigned to this VM");
+    }
+
+    // Group by a simple, deterministic "core_id = cpu / 2".
+    // This is intentionally simple and portable; we do *not* fail if a
+    // given core has only one thread or an unexpected count.
+    let mut cores: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for cpu in host {
+        let core_id = cpu / 2;
+        cores.entry(core_id).or_default().push(cpu);
+    }
+
+    let mut host_pairs: Vec<(u32, Vec<u32>)> = Vec::new();
+
+    for (core_id, mut cpus) in cores {
+        cpus.sort_unstable();
+        if cpus.is_empty() {
+            continue;
+        }
+        host_pairs.push((core_id, cpus));
+    }
+
+    if host_pairs.is_empty() {
+        return CpuTopologyStatus::Unavailable("host CPU topology could not be derived");
+    }
+
+    CpuTopologyStatus::Available {
+        vcpu_pairs,
+        host_pairs,
+    }
 }
 
 /// Highly stochastic EMI-style shimmer for panel borders.

@@ -2,7 +2,10 @@
 
 use std::collections::HashMap;
 
-use crate::ipc::{IpcEvent, IpcEventKind, IpcVmEvents, IpcVmState, IpcVmStatus};
+use crate::ipc::{
+    IpcEvent, IpcEventKind, IpcVmCpuLayout, IpcVmCpuSample, IpcVmEvents, IpcVmHugepages,
+    IpcVmState, IpcVmStatus,
+};
 
 // ---- Real Daemon State + Core Integration (Phase 11) ----------------------
 //
@@ -205,6 +208,24 @@ impl DaemonState {
                 let name_str = name.as_str();
                 let vm_cfg = &cfg.vm[name_str];
 
+                // Projection model fields that can be derived from config alone.
+                let cpu_layout = IpcVmCpuLayout {
+                    host: parse_cpu_list(vm_cfg.cpu.host_cpus.as_str()).unwrap_or_default(),
+                    vm: parse_cpu_list(vm_cfg.cpu.vm_cpus.as_str()).unwrap_or_default(),
+                };
+
+                let hugepages = vm_cfg.qemu.hugepages;
+
+                // Runtime-derived detail; default for "no active VM".
+                let mut hugepages_detail = IpcVmHugepages {
+                    active: false,
+                    node: None,
+                    pages: 0,
+                    bytes: 0,
+                };
+
+                let mut cpu_sample: Option<IpcVmCpuSample> = None;
+
                 let (view_state, cpu_pinned, irq_pinned, tasmota_on) = if let Some(dvm) =
                     self.vms.get_mut(name_str)
                 {
@@ -225,11 +246,11 @@ impl DaemonState {
                             match qstate.child.try_wait() {
                                 Ok(Some(status)) => {
                                     info!(
-                                            vm = name_str,
-                                            pid = qstate.pid,
-                                            ?status,
-                                            "daemon: detected QEMU process exit (guest-initiated shutdown)"
-                                        );
+                                        vm = name_str,
+                                        pid = qstate.pid,
+                                        ?status,
+                                        "daemon: detected QEMU process exit (guest-initiated shutdown)"
+                                    );
                                     // Drop the QEMU handle so qemu::shutdown() is a no-op.
                                     dvm.sm.rt.qemu = None;
                                     // Ask the core to walk the shutdown path on the next tick.
@@ -269,11 +290,25 @@ impl DaemonState {
                     // NOTE: tasmota_powered is a Cell<bool>; read with .get()
                     let mut tasmota_on = tasmota_configured && dvm.sm.rt.tasmota_powered.get();
 
-                    // FIXED: use matches!() instead of == (IpcVmState does NOT implement PartialEq)
+                    // When the VM is stopped, we explicitly drop pinned + tasmota flags
+                    // in the projection model so the TUI does not carry stale state.
                     if matches!(view_state, IpcVmState::Stopped) {
                         cpu_pinned = false;
                         irq_pinned = false;
                         tasmota_on = false;
+                    }
+
+                    // Populate hugepage detail from runtime.
+                    hugepages_detail = IpcVmHugepages {
+                        active: dvm.sm.rt.hugepages_active,
+                        node: dvm.sm.rt.hugepages_node,
+                        pages: dvm.sm.rt.hugepages_pages,
+                        bytes: dvm.sm.rt.hugepages_bytes,
+                    };
+
+                    // Snapshot raw vCPU usage when the VM is running.
+                    if matches!(view_state, IpcVmState::Running) {
+                        cpu_sample = snapshot_vm_cpu_sample(&dvm.sm.rt);
                     }
 
                     (view_state, cpu_pinned, irq_pinned, tasmota_on)
@@ -289,8 +324,6 @@ impl DaemonState {
                 }
                 .to_string();
 
-                let hugepages = vm_cfg.qemu.hugepages;
-
                 vms_status.push(IpcVmStatus {
                     name: name_str.to_string(),
                     state: view_state,
@@ -299,6 +332,9 @@ impl DaemonState {
                     tasmota_on,
                     isolation_mode,
                     hugepages,
+                    cpu_layout,
+                    hugepages_detail,
+                    cpu_sample,
                 });
             }
         }
@@ -681,4 +717,92 @@ fn device_kind_matches(func: &PciFunction, kind: DeviceKind) -> bool {
         DeviceKind::Nic => func.is_network_controller(),
         DeviceKind::Usb => func.is_usb_controller(),
     }
+}
+
+/// Local copy of the vCPU thread-name parser used in core affinity.
+///
+/// Historically QEMU vCPU threads show up as "CPU N/KVM". To make this
+/// robust against minor QEMU variations, we accept:
+///
+///   - "CPU N"
+///   - "CPU N/KVM"
+///   - "CPU N/kvm"
+///   - "CPU N/qemu"
+///   - "CPU N/<anything>"
+///
+/// and simply parse the first integer after "CPU ".
+fn parse_vcpu_name(name: &str) -> Option<u32> {
+    if !name.starts_with("CPU ") {
+        return None;
+    }
+
+    let rest = &name[4..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+
+    if digits.is_empty() {
+        return None;
+    }
+
+    digits.parse::<u32>().ok()
+}
+
+/// Snapshot raw vCPU usage for a VM into the IPC projection model.
+///
+/// This is intentionally minimal and deterministic:
+///   - If QEMU is not present, returns None.
+///   - If /proc lookups fail, returns None.
+///   - On success, returns a single IpcVmCpuSample with per-vCPU jiffies.
+///
+/// No heuristics, no retries, no time windows; the TUI is responsible
+/// for turning these counters into "load" over time.
+fn snapshot_vm_cpu_sample(rt: &VmRuntime) -> Option<IpcVmCpuSample> {
+    use procfs::process::Process;
+
+    let q = rt.qemu.as_ref()?;
+    let pid = q.pid;
+
+    let proc = Process::new(pid).ok()?;
+    let tasks = proc.tasks().ok()?;
+
+    let mut pairs: Vec<(u32, u64)> = Vec::new();
+
+    for task_res in tasks {
+        let task = match task_res {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        let stat = match task.stat() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let idx = match parse_vcpu_name(&stat.comm) {
+            Some(i) => i,
+            None => continue,
+        };
+
+        // utime + stime: userspace + kernel jiffies.
+        let total = stat.utime.saturating_add(stat.stime);
+        pairs.push((idx, total));
+    }
+
+    if pairs.is_empty() {
+        return None;
+    }
+
+    pairs.sort_by_key(|(idx, _)| *idx);
+
+    let mut vcpu_indices = Vec::with_capacity(pairs.len());
+    let mut vcpu_jiffies = Vec::with_capacity(pairs.len());
+
+    for (idx, ticks) in pairs {
+        vcpu_indices.push(idx);
+        vcpu_jiffies.push(ticks);
+    }
+
+    Some(IpcVmCpuSample {
+        vcpu_indices,
+        vcpu_jiffies,
+    })
 }
