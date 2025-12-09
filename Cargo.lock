@@ -283,6 +283,7 @@ dependencies = [
  "anyhow",
  "chalybs-core",
  "clap",
+ "procfs",
  "serde",
  "serde_json",
  "tracing",

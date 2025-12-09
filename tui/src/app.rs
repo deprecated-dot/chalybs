@@ -3,7 +3,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use chalybsd::ipc::{IpcEvent, IpcEventKind, IpcMessage, IpcVmState, IpcVmStatus};
+use chalybsd::ipc::{IpcEvent, IpcEventKind, IpcMessage, IpcVmCpuLayout, IpcVmState, IpcVmStatus};
 use serde_json;
 
 use crate::config::{LogoHaloProfile, TuiConfig};
@@ -74,6 +74,8 @@ pub struct VmStatus {
     pub tasmota_on: bool,
     pub isolation_mode: String,
     pub hugepages: bool,
+    /// Config-derived CPU layout (host + vCPU sets) projected from IPC.
+    pub cpu_layout: IpcVmCpuLayout,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,6 +240,11 @@ impl ChalybsBackend for MockBackend {
                 tasmota_on: true,
                 isolation_mode: "enforce".to_string(),
                 hugepages: true,
+                cpu_layout: IpcVmCpuLayout {
+                    // Example pinning: 4 SMT pairs on host cores 6–9.
+                    host: vec![12, 13, 14, 15, 16, 17, 18, 19],
+                    vm: vec![0, 1, 2, 3, 4, 5, 6, 7],
+                },
             },
             VmStatus {
                 name: "linux-lab".to_string(),
@@ -247,6 +254,11 @@ impl ChalybsBackend for MockBackend {
                 tasmota_on: false,
                 isolation_mode: "audit".to_string(),
                 hugepages: false,
+                cpu_layout: IpcVmCpuLayout {
+                    // Simple 1-core/2-thread mapping.
+                    host: vec![0, 1],
+                    vm: vec![0, 1],
+                },
             },
             VmStatus {
                 name: "baremetal-sim".to_string(),
@@ -256,6 +268,11 @@ impl ChalybsBackend for MockBackend {
                 tasmota_on: false,
                 isolation_mode: "disabled".to_string(),
                 hugepages: true,
+                cpu_layout: IpcVmCpuLayout {
+                    // Two cores worth of SMT pairs.
+                    host: vec![24, 25, 26, 27],
+                    vm: vec![0, 1, 2, 3],
+                },
             },
         ]
     }
@@ -544,6 +561,7 @@ impl DaemonBackend {
             tasmota_on: src.tasmota_on,
             isolation_mode: src.isolation_mode,
             hugepages: src.hugepages,
+            cpu_layout: src.cpu_layout,
         }
     }
 
