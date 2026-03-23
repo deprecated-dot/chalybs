@@ -14,7 +14,12 @@ host_cpus = "0-7,32-39"
 vm_cpus   = "8-15,40-47"
 
 [vm.win11-gpu.qemu]
-binary    = "/usr/bin/qemu-system-x86_64"
+binary      = "/usr/bin/qemu-system-x86_64"
+rombar_off  = ["0000:0e:00.0"]
+legacy_primary_gpu = false # default, can be omitted, included for completeness
+
+# testing CPU auto detection
+cpu_model = "auto"
 
 # Arguments injected BEFORE core Chalybs-managed QEMU args.
 # This is where you can set -name, debug-threads, -nodefaults, etc.
@@ -35,8 +40,20 @@ hugepages = true
 ovmf_code = "/usr/share/OVMF/OVMF_CODE.fd"
 ovmf_vars = "/var/lib/chalybs/win11_ovmf_vars.fd"
 
+# RTC behavior:
+#   Default: base=localtime,driftfix=slew
+#   -OMit or comment out 'rtc' to get this default
+#   -Set 'rtc = ""' (emtpy) to let QEMU use its own default (UTC)
+#   -Set a custom string to override entirely, e.g.;
+#       rtc = "base=utc,driftfix=none"
+rtc       = "base=localtime,driftfix=slew"
+
 # Optional: CPU model / hypervisor extras. If omitted, Chalybs uses:
 #   -cpu host
+#   ABI="EPYC-v2"
+#   TOPO="pdpe1gb,+hypervisor,+invtsc,+topoext,+kvm"
+#   HV_CONTEXTS="hv-stimer,hv-time,hv-synic,hv-vpindex,hv-avic"
+#   VENDOR_ID="hv-vendor-id=$BASEBOARD_MANUFACTURER" (ASUSTeK)
 [vm.win11-gpu.qemu.cpu_extras]
 # QEMU CPU model (e.g. "EPYC-v2"); if unset, defaults to "host".
 abi          = "EPYC-v2"
@@ -48,20 +65,19 @@ topo         = "pdpe1gb,+hypervisor,+invtsc,+topoext,+kvm"
 hv_contexts  = "hv-stimer,hv-time,hv-synic,hv-vpindex,hv-avic"
 
 # Hypervisor vendor id fragment.
-vendor_id    = "hv-vendor-id=ASUSTeK"
+vendor_id    = "hv-vendor-id=supercool"
 
 # Optional SMBIOS configuration (type 0/1/2).
 [vm.win11-gpu.qemu.smbios]
-bios_vendor           = "AMI"
-bios_version          = "2701"
-bios_date             = "03/14/2024"
+bios_vendor             = "supercool-computer-manufacturer"
+bios_version            = "9999"
+bios_date               = "03/14/2024"
 
-system_manufacturer   = "PHI"
-system_product_name   = "SIMULACRUM"
-system_uuid           = "cebd95d1-b040-a276-7367-40b076a27366"
-
-baseboard_manufacturer = "ASUSTeK"
-baseboard_product      = "ZEA"
+system_manufacturer     = "yours-truly"
+system_product_name     = "fancy-box"
+system_uuid             = "abcd12e3-f456-g789-0123-45h678i90123"
+baseboard_manufacturer  = "supercool"
+baseboard_product       = "megaboard"
 
 [vm.win11-gpu.numa]
 # Prefer placing vCPUs / IRQs on this NUMA node.
@@ -70,6 +86,9 @@ node = 1
 # ----------------------------
 # PCI passthrough devices
 # ----------------------------
+#
+# Additional PCI_DEVICES and/or PCI_DEVICES_NO_ROMBAR can be added here, or under NVMe/NIC/USB as needed
+# set your devices and true/false to satisfy enforcement
 
 [[vm.win11-gpu.devices.gpu]]
 pci_address = "0000:0a:00.0"
@@ -82,6 +101,10 @@ required    = true
 [[vm.win11-gpu.devices.nic]]
 pci_address = "0000:0c:00.0"
 required    = false
+
+[[vm.win11-gpu.devices.usb]]
+pci_address = "0000:0d:00.0"
+requierd    = false
 
 # ----------------------------
 # GPU policy (single-GPU safety)
@@ -131,9 +154,10 @@ forbid_host_critical_in_group = true
 # ----------------------------
 
 [vm.win11-gpu.peripherals.tasmota]
-url         = "http://tasmota-kvm.local/cm"
-on_command  = "Power ON"
-off_command = "Power OFF"
+mqtt_host   = "url-or-ip:port"
+username    = "!changeme!"
+password    = "!changeme!"
+device_id   = "tasmotaID_123456"
 
 [vm.win11-gpu.peripherals.ddc]
 monitor_i2c_bus = 4
@@ -142,6 +166,11 @@ host_input      = 1
 
 [vm.win11-gpu.peripherals.looking_glass]
 shm_name = "looking-glass"
+
+[vm.win11-gpu.peripherals.spice]
+enabled = true
+port = 5900
+addr = "127.0.0.1"
 
 # ----------------------------
 # Global logging
